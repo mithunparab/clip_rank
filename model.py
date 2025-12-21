@@ -9,7 +9,7 @@ class MobileCLIPRanker(nn.Module):
         full_model, _, _ = mobileclip.create_model_and_transforms(model_name, pretrained=pretrained_path)
         
         self.backbone = full_model.image_encoder
-        
+
         for param in self.backbone.parameters():
             param.requires_grad = False
             
@@ -21,15 +21,16 @@ class MobileCLIPRanker(nn.Module):
             
             if len(parameters_to_train) > 10: 
                 break
-                
+        
         with torch.no_grad():
+            self.backbone.eval()
             dummy = torch.zeros(1, 3, 224, 224)
             dim = self.backbone(dummy).shape[1]
             
         self.score_head = nn.Linear(dim, 1, bias=False)
 
     def forward(self, x):
-        self.backbone.train() 
+        self.backbone.eval()
         
         features = self.backbone(x)
         
