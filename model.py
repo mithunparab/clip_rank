@@ -19,13 +19,13 @@ class MobileCLIPRanker(nn.Module):
             
         self.quality_anchor = nn.Parameter(torch.randn(1, dim))
         
-        self.logit_scale = nn.Parameter(torch.ones([]) * 4.6052) 
 
     def forward(self, x):
         image_features = self.backbone(x)
         image_features = F.normalize(image_features, dim=-1)
         
         anchor = F.normalize(self.quality_anchor, dim=-1)
-
+        
         similarity = (image_features @ anchor.T).squeeze(1)
+        
         return similarity
