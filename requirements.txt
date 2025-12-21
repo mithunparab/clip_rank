@@ -1,0 +1,9 @@
+torch
+torchvision
+pandas
+numpy
+opencv-python
+scikit-learn
+Pillow
+git+https://github.com/apple/ml-mobileclip.git
+requests
