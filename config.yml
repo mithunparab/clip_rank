@@ -11,11 +11,12 @@ data:
 
 model:
   name: "mobileclip_b"
+  num_anchors: 5 
 
 train:
   batch_size: 64
-  lr_backbone: 1.0e-5
-  lr_anchor: 1.0e-3
-  epochs: 15
+  lr_backbone: 2.0e-6   
+  lr_anchor: 5.0e-3     
+  epochs: 20
   weight_decay: 0.01
   seed: 42
