@@ -1,11 +1,9 @@
 import torch
 from torch.utils.data import Dataset
 import pandas as pd
-import numpy as np
+import os
 from PIL import Image
 import mobileclip
-import requests
-from io import BytesIO
 
 class PropertyPreferenceDataset(Dataset):
     def __init__(self, csv_path_or_df, model_name='mobileclip_s2', pretrained_path=None, img_size=224):
@@ -18,14 +16,16 @@ class PropertyPreferenceDataset(Dataset):
         else:
             df = csv_path_or_df
 
-        if df.empty:
-            return
-        
+        if df.empty: return
+
+        df['file_path'] = df.index.map(lambda x: f"images/{x}.jpg")
+        df = df[df['file_path'].apply(os.path.exists)]
+
         if 'group_id' in df.columns and 'label' in df.columns:
             groups = df.groupby(['group_id', 'label'])
             
             for _, group in groups:
-                records = group.to_dict('records')
+                records = group.to_dict('records') 
                 n = len(records)
                 if n < 2: continue
                     
@@ -39,29 +39,24 @@ class PropertyPreferenceDataset(Dataset):
                         if score_a > score_b:
                             diff = score_a - score_b
                             self.pairs.append({
-                                'win': records[i],
-                                'lose': records[j],
+                                'win_path': records[i]['file_path'],
+                                'lose_path': records[j]['file_path'],
                                 'weight': diff
                             })
 
     def __len__(self):
         return len(self.pairs)
 
-    def _download_image(self, url):
+    def _load_local(self, path):
         try:
-            resp = requests.get(url, timeout=3)
-            img = Image.open(BytesIO(resp.content)).convert('RGB')
-            return img
+            img = Image.open(path).convert('RGB')
         except:
             return Image.new('RGB', (self.img_size, self.img_size))
-
-    def _letterbox_process(self, img_pil):
-        w, h = img_pil.size
+            
+        w, h = img.size
         scale = self.img_size / max(h, w)
         new_w, new_h = int(w * scale), int(h * scale)
-        
-        img_resized = img_pil.resize((new_w, new_h), Image.Resampling.BILINEAR)
-        
+        img_resized = img.resize((new_w, new_h), Image.Resampling.BILINEAR)
         background = Image.new('RGB', (self.img_size, self.img_size), (0, 0, 0))
         offset = ((self.img_size - new_w) // 2, (self.img_size - new_h) // 2)
         background.paste(img_resized, offset)
@@ -71,12 +66,8 @@ class PropertyPreferenceDataset(Dataset):
     def __getitem__(self, idx):
         item = self.pairs[idx]
         
-        win_pil = self._download_image(item['win']['url'])
-        lose_pil = self._download_image(item['lose']['url'])
-        
-        win_tensor = self._letterbox_process(win_pil)
-        lose_tensor = self._letterbox_process(lose_pil)
-        
+        win_tensor = self._load_local(item['win_path'])
+        lose_tensor = self._load_local(item['lose_path'])
         weight = torch.tensor(item['weight'], dtype=torch.float32)
         
         return win_tensor, lose_tensor, weight

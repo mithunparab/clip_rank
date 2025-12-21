@@ -16,7 +16,7 @@ from model import MobileCLIPRanker
 CSV_PATH = "dataset.csv" 
 MODEL_NAME = 'mobileclip_s2'
 BATCH_SIZE = 32
-LR = 1e-4 
+LR = 1e-5 
 EPOCHS = 10
 
 def setup_ddp():
@@ -29,6 +29,9 @@ def cleanup_ddp():
 def bradley_terry_loss(win_scores, lose_scores, weights):
     diff = win_scores - lose_scores
     loss = -F.logsigmoid(diff)
+    
+    weights = torch.clamp(weights, min=1.0, max=5.0)
+    
     weighted_loss = loss * weights.view(-1, 1)
     return weighted_loss.mean()
 
@@ -37,24 +40,23 @@ def train_epoch(model, loader, optimizer, device):
     total_loss = torch.zeros(1).to(device)
     
     for win_img, lose_img, weights in loader:
-        win_img = win_img.to(device)
-        lose_img = lose_img.to(device)
+        win_img, lose_img = win_img.to(device), lose_img.to(device)
         weights = weights.to(device)
         
         optimizer.zero_grad()
         
         batch = torch.cat([win_img, lose_img], dim=0)
-        
         all_scores = model(batch)
-    
         batch_size = win_img.size(0)
         s_win, s_lose = torch.split(all_scores, batch_size, dim=0)
         
         loss = bradley_terry_loss(s_win, s_lose, weights)
         
         loss.backward()
-        optimizer.step()
         
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
+        optimizer.step()
         total_loss += loss.detach()
         
     dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
@@ -67,6 +69,9 @@ def validate(model, df_val, device):
     
     ds_helper = PropertyPreferenceDataset(pd.DataFrame(), model_name=MODEL_NAME)
     
+    df_val = df_val.copy()
+    df_val['file_path'] = df_val.index.map(lambda x: f"images/{x}.jpg")
+    
     grouped = df_val.groupby(['group_id', 'label'])
     
     with torch.no_grad():
@@ -78,16 +83,16 @@ def validate(model, df_val, device):
             gt_scores = []
             
             for r in recs:
-                img = ds_helper._download_image(r['url'])
-                tensor = ds_helper._letterbox_process(img)
+                if not os.path.exists(r['file_path']): continue
+                
+                tensor = ds_helper._load_local(r['file_path'])
                 batch_tensors.append(tensor)
                 gt_scores.append(r['score'])
             
+            if len(batch_tensors) < 2: continue
+            
             batch = torch.stack(batch_tensors).to(device)
-            
             pred_scores = model(batch).squeeze().cpu().numpy()
-            
-            if batch.shape[0] < 2: continue
             
             pred_winner_idx = np.argmax(pred_scores)
             best_gt_score = max(gt_scores)
@@ -100,15 +105,13 @@ def validate(model, df_val, device):
 
 def main():
     setup_ddp()
-    
     local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device(f"cuda:{local_rank}")
     
     if local_rank == 0:
         print(f"--- DDP Training Started on {torch.cuda.device_count()} GPUs ---")
-        df = pd.read_csv(CSV_PATH)
-    else:
-        df = pd.read_csv(CSV_PATH)
+        
+    df = pd.read_csv(CSV_PATH)
 
     gkf = GroupKFold(n_splits=5)
     groups = df['group_id'].values
@@ -121,7 +124,6 @@ def main():
         val_df = df.iloc[val_idx]
         
         train_ds = PropertyPreferenceDataset(train_df, model_name=MODEL_NAME)
-        
         train_sampler = DistributedSampler(train_ds, shuffle=True)
         
         train_loader = DataLoader(
@@ -139,20 +141,15 @@ def main():
         
         for epoch in range(EPOCHS):
             train_sampler.set_epoch(epoch)
-            
             loss = train_epoch(model, train_loader, optimizer, device)
             
             if local_rank == 0:
-                print(f"Epoch {epoch+1} | Train Loss: {loss:.4f}")
-                
                 acc = validate(model, val_df, device)
-                print(f"Epoch {epoch+1} | Val Accuracy: {acc:.4f}")
+                print(f"Epoch {epoch+1} | Loss: {loss:.4f} | Val Accuracy: {acc:.4f}")
                 
                 if (epoch + 1) % 5 == 0:
                     torch.save(model.module.state_dict(), f"mobileclip_ddp_fold{fold+1}.pth")
-
         break
-        
     cleanup_ddp()
 
 if __name__ == "__main__":
