@@ -33,6 +33,9 @@ def train_epoch(model, loader, criterion, optimizer, device):
         all_scores = model(batch)
         s_win, s_lose = torch.split(all_scores, win_img.size(0), dim=0)
         
+        s_win = s_win.view(-1)
+        s_lose = s_lose.view(-1)
+        
         target = torch.ones(s_win.size(0)).to(device)
         
         loss = criterion(s_win, s_lose, target)
@@ -95,6 +98,10 @@ def main():
     torch.manual_seed(cfg.train.seed)
     np.random.seed(cfg.train.seed)
 
+    if local_rank == 0:
+        print(f"--- Configuration Loaded: {cfg.model.name} ---")
+        print(f"--- DDP Training on {torch.cuda.device_count()} GPUs ---")
+
     df = pd.read_csv(cfg.data.csv_path)
 
     gkf = GroupKFold(n_splits=5)
@@ -127,7 +134,6 @@ def main():
     ]
     
     optimizer = optim.AdamW(param_groups, weight_decay=1e-2)
-    
     criterion = nn.MarginRankingLoss(margin=cfg.train.margin)
     
     for epoch in range(cfg.train.epochs):
