@@ -36,9 +36,11 @@ def train_epoch(model, loader, criterion, optimizer, device):
         s_win = s_win.view(-1)
         s_lose = s_lose.view(-1)
         
-        target = torch.ones(s_win.size(0)).to(device)
+        diff = s_win - s_lose
         
-        loss = criterion(s_win, s_lose, target)
+        target = torch.ones_like(diff)
+        
+        loss = criterion(diff, target)
         
         loss.backward()
         optimizer.step()
@@ -58,13 +60,11 @@ def validate(model, df_val, cfg, device):
     
     df_val = df_val.copy()
     df_val['file_path'] = df_val.index.map(lambda x: f"{cfg.data.images_dir}/{x}.jpg")
-    
     grouped = df_val.groupby(['group_id', 'label'])
     
     with torch.no_grad():
         for _, group in grouped:
             if len(group) < 2: continue
-            
             recs = [r for r in group.to_dict('records') if os.path.exists(r['file_path'])]
             if len(recs) < 2: continue
             
@@ -91,7 +91,6 @@ def validate(model, df_val, cfg, device):
 def main():
     setup_ddp()
     cfg = load_config()
-    
     local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device(f"cuda:{local_rank}")
     
@@ -99,11 +98,9 @@ def main():
     np.random.seed(cfg.train.seed)
 
     if local_rank == 0:
-        print(f"--- Configuration Loaded: {cfg.model.name} ---")
-        print(f"--- DDP Training on {torch.cuda.device_count()} GPUs ---")
+        print(f"--- DDP Training: {cfg.model.name} ---")
 
     df = pd.read_csv(cfg.data.csv_path)
-
     gkf = GroupKFold(n_splits=5)
     groups = df['group_id'].values
     folds = list(gkf.split(df, groups=groups))
@@ -112,29 +109,21 @@ def main():
     train_df = df.iloc[train_idx]
     val_df = df.iloc[val_idx]
     
-    train_ds = PropertyPreferenceDataset(train_df, 
-                                         model_name=cfg.model.name, 
-                                         img_size=cfg.data.img_size)
-    
+    train_ds = PropertyPreferenceDataset(train_df, model_name=cfg.model.name, img_size=cfg.data.img_size)
     train_sampler = DistributedSampler(train_ds, shuffle=True)
-    
-    train_loader = DataLoader(
-        train_ds, 
-        batch_size=cfg.train.batch_size, 
-        sampler=train_sampler, 
-        num_workers=cfg.system.num_workers, 
-        pin_memory=cfg.system.pin_memory
-    )
+    train_loader = DataLoader(train_ds, batch_size=cfg.train.batch_size, sampler=train_sampler, num_workers=cfg.system.num_workers, pin_memory=cfg.system.pin_memory)
     
     model = MobileCLIPRanker(cfg).to(device)
     model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
     
     param_groups = [
+        {'params': [p for n, p in model.module.backbone.named_parameters() if p.requires_grad], 'lr': cfg.train.lr_backbone},
         {'params': model.module.score_head.parameters(), 'lr': cfg.train.lr_head}
     ]
     
-    optimizer = optim.AdamW(param_groups, weight_decay=1e-2)
-    criterion = nn.MarginRankingLoss(margin=cfg.train.margin)
+    optimizer = optim.AdamW(param_groups, weight_decay=cfg.train.weight_decay)
+    
+    criterion = nn.BCEWithLogitsLoss()
     
     for epoch in range(cfg.train.epochs):
         train_sampler.set_epoch(epoch)
@@ -142,12 +131,11 @@ def main():
         
         if local_rank == 0:
             print(f"Epoch {epoch+1}/{cfg.train.epochs} | Loss: {loss:.4f}")
-            
             acc = validate(model, val_df, cfg, device)
             print(f"Epoch {epoch+1} | Val Accuracy: {acc:.4f}")
             
-            if acc > 0.55: 
-                torch.save(model.module.state_dict(), f"checkpoint_best.pth")
+            if acc > 0.50:
+                torch.save(model.module.state_dict(), f"checkpoint_epoch_{epoch+1}.pth")
 
     cleanup_ddp()
 
