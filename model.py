@@ -6,7 +6,9 @@ class MobileCLIPRanker(nn.Module):
     def __init__(self, model_name='mobileclip_s2', pretrained_path=None):
         super().__init__()
         
-        self.backbone, _, _ = mobileclip.create_model_and_transforms(model_name, pretrained=pretrained_path)
+        full_model, _, _ = mobileclip.create_model_and_transforms(model_name, pretrained=pretrained_path)
+        
+        self.backbone = full_model.image_encoder
         
         for param in self.backbone.parameters():
             param.requires_grad = False
@@ -22,14 +24,15 @@ class MobileCLIPRanker(nn.Module):
                 
         with torch.no_grad():
             dummy = torch.zeros(1, 3, 224, 224)
-            dim = self.backbone.encode_image(dummy).shape[1]
+            dim = self.backbone(dummy).shape[1]
             
         self.score_head = nn.Linear(dim, 1, bias=False)
 
     def forward(self, x):
         self.backbone.train() 
         
-        features = self.backbone.encode_image(x)
+        features = self.backbone(x)
+        
         features = features / features.norm(dim=-1, keepdim=True)
         
         score = self.score_head(features)
