@@ -10,7 +10,7 @@ data:
   val_fold: 0
 
 model:
-  name: "mobileclip_blt"  
+  name: "mobileclip_b"  
   head_hidden_dim: 512
 
 train:
