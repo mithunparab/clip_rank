@@ -18,27 +18,31 @@ class PropertyPreferenceDataset(Dataset):
         else:
             df = csv_path_or_df
 
-        groups = df.groupby(['group_id', 'label'])
+        if df.empty:
+            return
         
-        for _, group in groups:
-            records = group.to_dict('records')
-            n = len(records)
-            if n < 2: continue
-                
-            for i in range(n):
-                for j in range(n):
-                    if i == j: continue
+        if 'group_id' in df.columns and 'label' in df.columns:
+            groups = df.groupby(['group_id', 'label'])
+            
+            for _, group in groups:
+                records = group.to_dict('records')
+                n = len(records)
+                if n < 2: continue
                     
-                    score_a = records[i]['score']
-                    score_b = records[j]['score']
-                    
-                    if score_a > score_b:
-                        diff = score_a - score_b
-                        self.pairs.append({
-                            'win': records[i],
-                            'lose': records[j],
-                            'weight': diff
-                        })
+                for i in range(n):
+                    for j in range(n):
+                        if i == j: continue
+                        
+                        score_a = records[i]['score']
+                        score_b = records[j]['score']
+                        
+                        if score_a > score_b:
+                            diff = score_a - score_b
+                            self.pairs.append({
+                                'win': records[i],
+                                'lose': records[j],
+                                'weight': diff
+                            })
 
     def __len__(self):
         return len(self.pairs)
