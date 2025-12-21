@@ -17,15 +17,18 @@ class MobileCLIPRanker(nn.Module):
             dummy = torch.zeros(1, 3, cfg.data.img_size, cfg.data.img_size)
             dim = self.backbone(dummy).shape[1]
             
-        self.quality_anchor = nn.Parameter(torch.randn(1, dim))
+        self.anchors = nn.Parameter(torch.randn(cfg.model.num_anchors, dim))
         
+        nn.init.orthogonal_(self.anchors)
 
     def forward(self, x):
-        image_features = self.backbone(x)
-        image_features = F.normalize(image_features, dim=-1)
+        img_feats = self.backbone(x)
+        img_feats = F.normalize(img_feats, dim=-1)
         
-        anchor = F.normalize(self.quality_anchor, dim=-1)
+        anchor_feats = F.normalize(self.anchors, dim=-1)
         
-        similarity = (image_features @ anchor.T).squeeze(1)
+        sims = img_feats @ anchor_feats.T
         
-        return similarity
+        best_sim, _ = sims.max(dim=1)
+        
+        return best_sim
