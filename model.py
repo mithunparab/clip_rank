@@ -12,15 +12,6 @@ class MobileCLIPRanker(nn.Module):
         for param in self.backbone.parameters():
             param.requires_grad = False
             
-        parameters_to_train = []
-        for name, param in list(self.backbone.named_parameters())[::-1]:
-            if any(x in name for x in ['head', 'projector', 'fc', 'layer_scale', 'norm', 'resblocks.11']):
-                param.requires_grad = True
-                parameters_to_train.append(name)
-            
-            if len(parameters_to_train) > 20: 
-                break
-        
         with torch.no_grad():
             self.backbone.eval()
             dummy = torch.zeros(1, 3, cfg.data.img_size, cfg.data.img_size)
@@ -28,11 +19,19 @@ class MobileCLIPRanker(nn.Module):
             
         self.score_head = nn.Sequential(
             nn.Linear(dim, cfg.model.head_hidden_dim),
-            nn.BatchNorm1d(cfg.model.head_hidden_dim),
+            nn.LayerNorm(cfg.model.head_hidden_dim), 
             nn.GELU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.1),
             nn.Linear(cfg.model.head_hidden_dim, 1)
         )
+        
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
 
     def train(self, mode=True):
         super().train(mode)
@@ -41,5 +40,8 @@ class MobileCLIPRanker(nn.Module):
 
     def forward(self, x):
         self.backbone.eval()
-        features = self.backbone(x)
+        with torch.no_grad():
+            features = self.backbone(x)
+            features = features / features.norm(dim=-1, keepdim=True)
+        
         return self.score_head(features)
