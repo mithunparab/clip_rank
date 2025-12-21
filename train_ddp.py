@@ -1,6 +1,7 @@
 import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -20,12 +21,23 @@ def setup_ddp():
 def cleanup_ddp():
     dist.destroy_process_group()
 
-def train_epoch(model, loader, criterion, optimizer, device):
+def weighted_bradley_terry_loss(s_win, s_lose, weights):
+    diff = s_win - s_lose
+    
+    loss = F.softplus(-diff)
+    
+    weights = torch.clamp(weights, min=1.0, max=5.0)
+    
+    weighted_loss = loss * weights
+    return weighted_loss.mean()
+
+def train_epoch(model, loader, optimizer, device):
     model.train() 
     total_loss = torch.zeros(1).to(device)
     
     for win_img, lose_img, weights in loader:
         win_img, lose_img = win_img.to(device), lose_img.to(device)
+        weights = weights.to(device)
         
         optimizer.zero_grad()
         
@@ -36,11 +48,7 @@ def train_epoch(model, loader, criterion, optimizer, device):
         s_win = s_win.view(-1)
         s_lose = s_lose.view(-1)
         
-        diff = s_win - s_lose
-        
-        target = torch.ones_like(diff)
-        
-        loss = criterion(diff, target)
+        loss = weighted_bradley_terry_loss(s_win, s_lose, weights)
         
         loss.backward()
         optimizer.step()
@@ -65,6 +73,7 @@ def validate(model, df_val, cfg, device):
     with torch.no_grad():
         for _, group in grouped:
             if len(group) < 2: continue
+            
             recs = [r for r in group.to_dict('records') if os.path.exists(r['file_path'])]
             if len(recs) < 2: continue
             
@@ -97,9 +106,6 @@ def main():
     torch.manual_seed(cfg.train.seed)
     np.random.seed(cfg.train.seed)
 
-    if local_rank == 0:
-        print(f"--- DDP Training: {cfg.model.name} ---")
-
     df = pd.read_csv(cfg.data.csv_path)
     gkf = GroupKFold(n_splits=5)
     groups = df['group_id'].values
@@ -116,25 +122,23 @@ def main():
     model = MobileCLIPRanker(cfg).to(device)
     model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
     
-    param_groups = [
-        {'params': [p for n, p in model.module.backbone.named_parameters() if p.requires_grad], 'lr': cfg.train.lr_backbone},
-        {'params': model.module.score_head.parameters(), 'lr': cfg.train.lr_head}
-    ]
+    optimizer = optim.AdamW(model.module.score_head.parameters(), 
+                           lr=cfg.train.lr_head, 
+                           weight_decay=cfg.train.weight_decay)
     
-    optimizer = optim.AdamW(param_groups, weight_decay=cfg.train.weight_decay)
-    
-    criterion = nn.BCEWithLogitsLoss()
-    
+    if local_rank == 0:
+        print(f"--- Training Head Only: LR={cfg.train.lr_head} ---")
+
     for epoch in range(cfg.train.epochs):
         train_sampler.set_epoch(epoch)
-        loss = train_epoch(model, train_loader, criterion, optimizer, device)
+        loss = train_epoch(model, train_loader, optimizer, device)
         
         if local_rank == 0:
             print(f"Epoch {epoch+1}/{cfg.train.epochs} | Loss: {loss:.4f}")
             acc = validate(model, val_df, cfg, device)
             print(f"Epoch {epoch+1} | Val Accuracy: {acc:.4f}")
             
-            if acc > 0.50:
+            if acc > 0.5:
                 torch.save(model.module.state_dict(), f"checkpoint_epoch_{epoch+1}.pth")
 
     cleanup_ddp()
