@@ -33,17 +33,22 @@ def bradley_terry_loss(win_scores, lose_scores, weights):
     return weighted_loss.mean()
 
 def train_epoch(model, loader, optimizer, device):
-    model.train()
+    model.train() 
     total_loss = torch.zeros(1).to(device)
     
     for win_img, lose_img, weights in loader:
-        win_img, lose_img = win_img.to(device), lose_img.to(device)
+        win_img = win_img.to(device)
+        lose_img = lose_img.to(device)
         weights = weights.to(device)
         
         optimizer.zero_grad()
         
-        s_win = model(win_img)
-        s_lose = model(lose_img)
+        batch = torch.cat([win_img, lose_img], dim=0)
+        
+        all_scores = model(batch)
+    
+        batch_size = win_img.size(0)
+        s_win, s_lose = torch.split(all_scores, batch_size, dim=0)
         
         loss = bradley_terry_loss(s_win, s_lose, weights)
         
