@@ -104,19 +104,22 @@ def main():
     train_df = df.iloc[train_idx]
     val_df = df.iloc[val_idx]
     
-    train_ds = PropertyPreferenceDataset(train_df, model_name=cfg.model.name, img_size=cfg.data.img_size)
+    train_ds = PropertyPreferenceDataset(train_df, 
+                                         model_name=cfg.model.name, 
+                                         img_size=cfg.data.img_size, 
+                                         is_train=True)
+    
     train_sampler = DistributedSampler(train_ds, shuffle=True)
-    train_loader = DataLoader(train_ds, batch_size=cfg.train.batch_size, sampler=train_sampler, num_workers=cfg.system.num_workers, pin_memory=cfg.system.pin_memory)
+    train_loader = DataLoader(train_ds, 
+                              batch_size=cfg.train.batch_size, sampler=train_sampler,
+                                num_workers=cfg.system.num_workers, pin_memory=cfg.system.pin_memory)
     
     model = MobileCLIPRanker(cfg).to(device)
-    # find_unused_parameters=False is safe now as we use the whole image encoder
+
     model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
     
-    # --- Fine-Tuning Optimizer Setup ---
     param_groups = [
-        # Backbone gets tiny LR
         {'params': model.module.backbone.parameters(), 'lr': cfg.train.lr_backbone},
-        # Head gets higher LR
         {'params': model.module.score_head.parameters(), 'lr': cfg.train.lr_head}
     ]
     

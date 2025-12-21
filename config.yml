@@ -10,15 +10,15 @@ data:
   val_fold: 0
 
 model:
-  name: "mobileclip_s2"
-  head_hidden_dim: 256
+  name: "mobileclip_b_lt"  
+  head_hidden_dim: 512
 
 train:
-  batch_size: 64
-  lr_backbone: 1.0e-5   
-  lr_head: 1.0e-4       
+  batch_size: 8
+  lr_backbone: 5.0e-6     
+  lr_head: 1.0e-4
   epochs: 20
-  margin: 0.5          
-  weight_decay: 0.01
+  margin: 0.5
+  weight_decay: 0.05     
   grad_clip: 1.0
   seed: 42
