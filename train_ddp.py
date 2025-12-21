@@ -1,7 +1,6 @@
 import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -21,30 +20,19 @@ def setup_ddp():
 def cleanup_ddp():
     dist.destroy_process_group()
 
-def weighted_preference_loss(s_win, s_lose, score_diffs):
-    pred_diff = s_win - s_lose
-    loss = F.softplus(-pred_diff)
-    
-
-    weights = torch.log1p(score_diffs).view(-1, 1)
-    
-    return (loss * weights).mean()
-
 def train_epoch(model, loader, optimizer, device):
     model.train() 
     total_loss = torch.zeros(1).to(device)
     
-    for win_img, lose_img, gt_diff in loader:
-        win_img, lose_img = win_img.to(device), lose_img.to(device)
-        gt_diff = gt_diff.to(device)
+    for imgs, scores in loader:
+        imgs = imgs.to(device)
+        scores = scores.to(device) 
         
         optimizer.zero_grad()
         
-        batch = torch.cat([win_img, lose_img], dim=0)
-        all_scores = model(batch)
-        s_win, s_lose = torch.split(all_scores, win_img.size(0), dim=0)
+        preds = model(imgs)
         
-        loss = weighted_preference_loss(s_win, s_lose, gt_diff)
+        loss = nn.MSELoss()(preds, scores)
         
         loss.backward()
         optimizer.step()
@@ -83,6 +71,7 @@ def validate(model, df_val, cfg, device):
                 gt_scores.append(r['score'])
             
             batch = torch.stack(batch_tensors).to(device)
+            
             pred_scores = model(batch).squeeze().cpu().numpy()
             
             pred_winner_idx = np.argmax(pred_scores)
@@ -126,13 +115,13 @@ def main():
     
     param_groups = [
         {'params': model.module.backbone.parameters(), 'lr': cfg.train.lr_backbone},
-        {'params': model.module.score_head.parameters(), 'lr': cfg.train.lr_head}
+        {'params': [model.module.quality_anchor], 'lr': cfg.train.lr_anchor}
     ]
     
     optimizer = optim.AdamW(param_groups, weight_decay=cfg.train.weight_decay)
 
     if local_rank == 0:
-        print(f"--- Training {cfg.model.name} (Corrected Augmentation) ---")
+        print(f"--- Training Concept Alignment (Clustering) ---")
 
     for epoch in range(cfg.train.epochs):
         train_sampler.set_epoch(epoch)
