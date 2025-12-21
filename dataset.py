@@ -7,7 +7,7 @@ import mobileclip
 from torchvision import transforms
 
 class PropertyPreferenceDataset(Dataset):
-    def __init__(self, csv_path_or_df, model_name='mobileclip_s2', pretrained_path=None, img_size=224, is_train=False):
+    def __init__(self, csv_path_or_df, model_name='mobileclip_blt', pretrained_path=None, img_size=224, is_train=False):
         _, _, self.preprocess = mobileclip.create_model_and_transforms(model_name, pretrained=pretrained_path)
         self.img_size = img_size
         self.pairs = []
@@ -29,6 +29,7 @@ class PropertyPreferenceDataset(Dataset):
 
         if df.empty: return
 
+        # Pre-filter
         df['file_path'] = df.index.map(lambda x: f"images/{x}.jpg")
         df = df[df['file_path'].apply(os.path.exists)]
 
@@ -81,6 +82,6 @@ class PropertyPreferenceDataset(Dataset):
         lose_tensor = self._load_local(item['lose_path'])
         weight = torch.tensor(item['weight'], dtype=torch.float32)
         return win_tensor, lose_tensor, weight
-    
+
     def __len__(self):
         return len(self.pairs)
