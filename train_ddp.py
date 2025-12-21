@@ -51,9 +51,11 @@ def validate(model, df_val, cfg, device):
     correct = 0
     total = 0
     
+    # is_train=False for validation (No augmentation)
     ds_helper = PropertyPreferenceDataset(pd.DataFrame(), 
                                           model_name=cfg.model.name, 
-                                          img_size=cfg.data.img_size)
+                                          img_size=cfg.data.img_size,
+                                          is_train=False)
     
     df_val = df_val.copy()
     df_val['file_path'] = df_val.index.map(lambda x: f"{cfg.data.images_dir}/{x}.jpg")
@@ -110,12 +112,15 @@ def main():
                                          is_train=True)
     
     train_sampler = DistributedSampler(train_ds, shuffle=True)
-    train_loader = DataLoader(train_ds, 
-                              batch_size=cfg.train.batch_size, sampler=train_sampler,
-                                num_workers=cfg.system.num_workers, pin_memory=cfg.system.pin_memory)
+    train_loader = DataLoader(
+        train_ds, 
+        batch_size=cfg.train.batch_size, 
+        sampler=train_sampler, 
+        num_workers=cfg.system.num_workers, 
+        pin_memory=cfg.system.pin_memory
+    )
     
     model = MobileCLIPRanker(cfg).to(device)
-
     model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
     
     param_groups = [
@@ -127,7 +132,7 @@ def main():
     criterion = nn.MarginRankingLoss(margin=cfg.train.margin)
     
     if local_rank == 0:
-        print(f"--- Fine-Tuning Backbone (LR={cfg.train.lr_backbone}) + Head (LR={cfg.train.lr_head}) ---")
+        print(f"--- Training {cfg.model.name} with Augmentation ---")
 
     for epoch in range(cfg.train.epochs):
         train_sampler.set_epoch(epoch)
