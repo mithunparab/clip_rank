@@ -19,13 +19,22 @@ class PropertyPreferenceDataset(Dataset):
         if df.empty: return
 
         df['file_path'] = df.index.map(lambda x: f"images/{x}.jpg")
+        
+        initial_count = len(df)
         df = df[df['file_path'].apply(os.path.exists)]
+        final_count = len(df)
+        
+        if final_count == 0:
+            print(f"WARNING: No local images found! Expected 'images/0.jpg', etc.")
+            print(f"Current Working Directory: {os.getcwd()}")
+            print(f"Did you run prepare_data.py?")
+            return
 
         if 'group_id' in df.columns and 'label' in df.columns:
             groups = df.groupby(['group_id', 'label'])
             
             for _, group in groups:
-                records = group.to_dict('records') 
+                records = group.to_dict('records')
                 n = len(records)
                 if n < 2: continue
                     
@@ -43,6 +52,8 @@ class PropertyPreferenceDataset(Dataset):
                                 'lose_path': records[j]['file_path'],
                                 'weight': diff
                             })
+        
+        print(f"Dataset Loaded: {len(self.pairs)} pairs from {final_count} images.")
 
     def __len__(self):
         return len(self.pairs)
