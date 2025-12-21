@@ -7,17 +7,19 @@ import mobileclip
 from torchvision import transforms
 
 class PropertyPreferenceDataset(Dataset):
-    def __init__(self, csv_path_or_df, model_name='mobileclip_blt', pretrained_path=None, img_size=224, is_train=False):
+    def __init__(self, csv_path_or_df, model_name='mobileclip_b', pretrained_path=None, img_size=224, is_train=False):
         _, _, self.preprocess = mobileclip.create_model_and_transforms(model_name, pretrained=pretrained_path)
         self.img_size = img_size
         self.pairs = []
         self.is_train = is_train
         
+        # --- FIXED AUGMENTATIONS ---
+        # REMOVED RandomResizedCrop: It destroys "spaciousness" cues (FOV/Edges)
         if is_train:
             self.aug = transforms.Compose([
                 transforms.RandomHorizontalFlip(p=0.5),
-                transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
-                transforms.RandomResizedCrop(size=img_size, scale=(0.9, 1.0), ratio=(0.95, 1.05)),
+                transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.05),
+                # No Zoom/Crop. We must see the whole room.
             ])
         else:
             self.aug = None
@@ -29,7 +31,6 @@ class PropertyPreferenceDataset(Dataset):
 
         if df.empty: return
 
-        # Pre-filter
         df['file_path'] = df.index.map(lambda x: f"images/{x}.jpg")
         df = df[df['file_path'].apply(os.path.exists)]
 
@@ -44,7 +45,6 @@ class PropertyPreferenceDataset(Dataset):
                 for i in range(n):
                     for j in range(n):
                         if i == j: continue
-                        
                         score_a = records[i]['score']
                         score_b = records[j]['score']
                         
@@ -64,8 +64,10 @@ class PropertyPreferenceDataset(Dataset):
         
         if self.is_train and self.aug:
             img = self.aug(img)
+            # MobileCLIP transforms handle resizing/normalization
             return self.preprocess(img)
             
+        # Validation: Letterbox to preserve aspect ratio
         w, h = img.size
         scale = self.img_size / max(h, w)
         new_w, new_h = int(w * scale), int(h * scale)

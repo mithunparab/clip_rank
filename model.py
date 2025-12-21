@@ -16,13 +16,13 @@ class MobileCLIPRanker(nn.Module):
             dummy = torch.zeros(1, 3, cfg.data.img_size, cfg.data.img_size)
             dim = self.backbone(dummy).shape[1]
             
+        
         self.score_head = nn.Sequential(
-            nn.Dropout(0.3), 
+            nn.Dropout(0.5), 
             nn.Linear(dim, cfg.model.head_hidden_dim),
             nn.LayerNorm(cfg.model.head_hidden_dim),
             nn.GELU(),
-            nn.Linear(cfg.model.head_hidden_dim, 1),
-            nn.Sigmoid()
+            nn.Linear(cfg.model.head_hidden_dim, 1)
         )
         
         self.apply(self._init_weights)
@@ -35,4 +35,5 @@ class MobileCLIPRanker(nn.Module):
 
     def forward(self, x):
         features = self.backbone(x)
-        return self.score_head(features) * 10.0
+        features = features / features.norm(dim=-1, keepdim=True)
+        return self.score_head(features)

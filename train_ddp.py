@@ -1,6 +1,7 @@
 import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -20,13 +21,22 @@ def setup_ddp():
 def cleanup_ddp():
     dist.destroy_process_group()
 
+def weighted_preference_loss(s_win, s_lose, score_diffs):
+    pred_diff = s_win - s_lose
+    loss = F.softplus(-pred_diff)
+    
+
+    weights = torch.log1p(score_diffs).view(-1, 1)
+    
+    return (loss * weights).mean()
+
 def train_epoch(model, loader, optimizer, device):
     model.train() 
     total_loss = torch.zeros(1).to(device)
     
     for win_img, lose_img, gt_diff in loader:
         win_img, lose_img = win_img.to(device), lose_img.to(device)
-        gt_diff = gt_diff.to(device) 
+        gt_diff = gt_diff.to(device)
         
         optimizer.zero_grad()
         
@@ -34,13 +44,7 @@ def train_epoch(model, loader, optimizer, device):
         all_scores = model(batch)
         s_win, s_lose = torch.split(all_scores, win_img.size(0), dim=0)
         
-        s_win = s_win.view(-1)
-        s_lose = s_lose.view(-1)
-        
-
-        pred_diff = s_win - s_lose
-        
-        loss = nn.MSELoss()(pred_diff, gt_diff)
+        loss = weighted_preference_loss(s_win, s_lose, gt_diff)
         
         loss.backward()
         optimizer.step()
@@ -52,7 +56,7 @@ def train_epoch(model, loader, optimizer, device):
 def validate(model, df_val, cfg, device):
     model.eval()
     correct_strict = 0
-    correct_relaxed = 0 
+    correct_relaxed = 0
     total = 0
     
     ds_helper = PropertyPreferenceDataset(pd.DataFrame(), 
@@ -67,7 +71,6 @@ def validate(model, df_val, cfg, device):
     with torch.no_grad():
         for _, group in grouped:
             if len(group) < 2: continue
-            
             recs = [r for r in group.to_dict('records') if os.path.exists(r['file_path'])]
             if len(recs) < 2: continue
             
@@ -83,14 +86,11 @@ def validate(model, df_val, cfg, device):
             pred_scores = model(batch).squeeze().cpu().numpy()
             
             pred_winner_idx = np.argmax(pred_scores)
-            
-            score_of_chosen = gt_scores[pred_winner_idx]
-            
             max_gt_score = max(gt_scores)
+            score_of_chosen = gt_scores[pred_winner_idx]
             
             if score_of_chosen == max_gt_score:
                 correct_strict += 1
-                
             if score_of_chosen >= (max_gt_score - 1.0):
                 correct_relaxed += 1
                 
@@ -132,19 +132,17 @@ def main():
     optimizer = optim.AdamW(param_groups, weight_decay=cfg.train.weight_decay)
 
     if local_rank == 0:
-        print(f"--- Training {cfg.model.name} (MSE Loss) ---")
+        print(f"--- Training {cfg.model.name} (Corrected Augmentation) ---")
 
     for epoch in range(cfg.train.epochs):
         train_sampler.set_epoch(epoch)
         loss = train_epoch(model, train_loader, optimizer, device)
         
         if local_rank == 0:
-            strict_acc, relaxed_acc = validate(model, val_df, cfg, device)
-            print(f"Epoch {epoch+1} | Loss: {loss:.4f}")
-            print(f"   Strict Acc:  {strict_acc:.4f}")
-            print(f"   Relaxed Acc: {relaxed_acc:.4f}")
+            strict, relaxed = validate(model, val_df, cfg, device)
+            print(f"Epoch {epoch+1} | Loss: {loss:.4f} | Strict: {strict:.4f} | Relaxed: {relaxed:.4f}")
             
-            if relaxed_acc > 0.65:
+            if strict > 0.45:
                 torch.save(model.module.state_dict(), f"checkpoint_epoch_{epoch+1}.pth")
 
     cleanup_ddp()
