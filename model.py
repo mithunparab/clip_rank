@@ -17,11 +17,12 @@ class MobileCLIPRanker(nn.Module):
             dim = self.backbone(dummy).shape[1]
             
         self.score_head = nn.Sequential(
-            nn.Dropout(0.2),
+            nn.Dropout(0.3), 
             nn.Linear(dim, cfg.model.head_hidden_dim),
             nn.LayerNorm(cfg.model.head_hidden_dim),
             nn.GELU(),
-            nn.Linear(cfg.model.head_hidden_dim, 1)
+            nn.Linear(cfg.model.head_hidden_dim, 1),
+            nn.Sigmoid()
         )
         
         self.apply(self._init_weights)
@@ -33,7 +34,5 @@ class MobileCLIPRanker(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
-
         features = self.backbone(x)
-        
-        return self.score_head(features)
+        return self.score_head(features) * 10.0
