@@ -6,21 +6,12 @@ class MobileCLIPRanker(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         
-        full_model, _, _ = mobileclip.create_model_and_transforms(cfg.model.name, pretrained=cfg.model.pretrained)
+        full_model, _, _ = mobileclip.create_model_and_transforms(cfg.model.name)
         self.backbone = full_model.image_encoder
         
         for param in self.backbone.parameters():
             param.requires_grad = False
             
-
-        parameters_to_train = []
-        for name, param in list(self.backbone.named_parameters())[::-1]:
-            if any(x in name for x in ['head', 'projector', 'fc', 'layer_scale', 'norm']):
-                param.requires_grad = True
-                parameters_to_train.append(name)
-            if len(parameters_to_train) > 12: 
-                break
-        
         with torch.no_grad():
             self.backbone.eval()
             dummy = torch.zeros(1, 3, cfg.data.img_size, cfg.data.img_size)
@@ -28,20 +19,19 @@ class MobileCLIPRanker(nn.Module):
             
         self.score_head = nn.Sequential(
             nn.Linear(dim, cfg.model.head_hidden_dim),
-            nn.LayerNorm(cfg.model.head_hidden_dim),
+            nn.BatchNorm1d(cfg.model.head_hidden_dim), 
             nn.GELU(),
-            nn.Dropout(0.2),
+            nn.Dropout(0.3),
             nn.Linear(cfg.model.head_hidden_dim, 1)
         )
 
     def train(self, mode=True):
         super().train(mode)
-        if mode:
-            self.backbone.eval()
+        self.backbone.eval() 
         return self
 
     def forward(self, x):
         self.backbone.eval()
-        features = self.backbone(x)
-        features = features / features.norm(dim=-1, keepdim=True)
+        with torch.no_grad():
+            features = self.backbone(x)
         return self.score_head(features)

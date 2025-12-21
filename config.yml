@@ -7,19 +7,16 @@ data:
   csv_path: "dataset.csv"
   images_dir: "images"
   img_size: 224
-  min_score_diff: 0.5
   val_fold: 0
 
 model:
   name: "mobileclip_s2"
-  pretrained: null
-  freeze_backbone: false
   head_hidden_dim: 512
 
 train:
   batch_size: 64
-  lr: 5.0e-5
-  epochs: 15
-  weight_decay: 0.05
-  grad_clip: 1.0
+  lr_backbone: 0.0      
+  lr_head: 1.0e-3       
+  epochs: 20
+  margin: 1.0           
   seed: 42

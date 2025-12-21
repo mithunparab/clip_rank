@@ -1,7 +1,6 @@
 import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -21,22 +20,12 @@ def setup_ddp():
 def cleanup_ddp():
     dist.destroy_process_group()
 
-def bradley_terry_loss(win_scores, lose_scores, weights):
-    diff = win_scores - lose_scores
-    loss = -F.logsigmoid(diff)
-    
-    smooth_weights = torch.log1p(weights).view(-1, 1)
-    
-    weighted_loss = loss * smooth_weights
-    return weighted_loss.mean()
-
-def train_epoch(model, loader, optimizer, cfg, device):
+def train_epoch(model, loader, criterion, optimizer, device):
     model.train() 
     total_loss = torch.zeros(1).to(device)
     
     for win_img, lose_img, weights in loader:
         win_img, lose_img = win_img.to(device), lose_img.to(device)
-        weights = weights.to(device)
         
         optimizer.zero_grad()
         
@@ -44,12 +33,11 @@ def train_epoch(model, loader, optimizer, cfg, device):
         all_scores = model(batch)
         s_win, s_lose = torch.split(all_scores, win_img.size(0), dim=0)
         
-        loss = bradley_terry_loss(s_win, s_lose, weights)
+        target = torch.ones(s_win.size(0)).to(device)
+        
+        loss = criterion(s_win, s_lose, target)
         
         loss.backward()
-        
-        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
-        
         optimizer.step()
         total_loss += loss.detach()
         
@@ -107,10 +95,6 @@ def main():
     torch.manual_seed(cfg.train.seed)
     np.random.seed(cfg.train.seed)
 
-    if local_rank == 0:
-        print(f"--- Configuration Loaded: {cfg.model.name} ---")
-        print(f"--- DDP Training on {torch.cuda.device_count()} GPUs ---")
-        
     df = pd.read_csv(cfg.data.csv_path)
 
     gkf = GroupKFold(n_splits=5)
@@ -136,16 +120,19 @@ def main():
     )
     
     model = MobileCLIPRanker(cfg).to(device)
-    
     model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
     
-    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), 
-                           lr=cfg.train.lr, 
-                           weight_decay=cfg.train.weight_decay)
+    param_groups = [
+        {'params': model.module.score_head.parameters(), 'lr': cfg.train.lr_head}
+    ]
+    
+    optimizer = optim.AdamW(param_groups, weight_decay=1e-2)
+    
+    criterion = nn.MarginRankingLoss(margin=cfg.train.margin)
     
     for epoch in range(cfg.train.epochs):
         train_sampler.set_epoch(epoch)
-        loss = train_epoch(model, train_loader, optimizer, cfg, device)
+        loss = train_epoch(model, train_loader, criterion, optimizer, device)
         
         if local_rank == 0:
             print(f"Epoch {epoch+1}/{cfg.train.epochs} | Loss: {loss:.4f}")
@@ -153,8 +140,8 @@ def main():
             acc = validate(model, val_df, cfg, device)
             print(f"Epoch {epoch+1} | Val Accuracy: {acc:.4f}")
             
-            if (epoch + 1) % 5 == 0 or acc > 0.5:
-                torch.save(model.module.state_dict(), f"checkpoint_epoch_{epoch+1}.pth")
+            if acc > 0.55: 
+                torch.save(model.module.state_dict(), f"checkpoint_best.pth")
 
     cleanup_ddp()
 
