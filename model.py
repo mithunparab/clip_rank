@@ -3,37 +3,38 @@ import torch.nn as nn
 import mobileclip
 
 class MobileCLIPRanker(nn.Module):
-    def __init__(self, model_name='mobileclip_s2', pretrained_path=None):
+    def __init__(self, cfg):
         super().__init__()
-        full_model, _, _ = mobileclip.create_model_and_transforms(model_name, pretrained=pretrained_path)
         
+        full_model, _, _ = mobileclip.create_model_and_transforms(cfg.model.name, pretrained=cfg.model.pretrained)
         self.backbone = full_model.image_encoder
-
+        
         for param in self.backbone.parameters():
             param.requires_grad = False
             
+
         parameters_to_train = []
         for name, param in list(self.backbone.named_parameters())[::-1]:
             if any(x in name for x in ['head', 'projector', 'fc', 'layer_scale', 'norm']):
                 param.requires_grad = True
                 parameters_to_train.append(name)
-            
-            if len(parameters_to_train) > 10: 
+            if len(parameters_to_train) > 12: 
                 break
         
         with torch.no_grad():
             self.backbone.eval()
-            dummy = torch.zeros(1, 3, 224, 224)
+            dummy = torch.zeros(1, 3, cfg.data.img_size, cfg.data.img_size)
             dim = self.backbone(dummy).shape[1]
             
-        self.score_head = nn.Linear(dim, 1, bias=False)
+        self.score_head = nn.Sequential(
+            nn.Linear(dim, cfg.model.head_hidden_dim),
+            nn.LayerNorm(cfg.model.head_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(cfg.model.head_hidden_dim, 1)
+        )
 
     def train(self, mode=True):
-        """
-        Critical Override:
-        When train() is called, we keep the backbone in eval mode 
-        to freeze BatchNorm statistics.
-        """
         super().train(mode)
         if mode:
             self.backbone.eval()
@@ -41,8 +42,6 @@ class MobileCLIPRanker(nn.Module):
 
     def forward(self, x):
         self.backbone.eval()
-        
         features = self.backbone(x)
         features = features / features.norm(dim=-1, keepdim=True)
-        score = self.score_head(features)
-        return score
+        return self.score_head(features)
