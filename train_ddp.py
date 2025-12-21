@@ -111,7 +111,8 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=cfg.train.batch_size, sampler=train_sampler, num_workers=cfg.system.num_workers, pin_memory=cfg.system.pin_memory)
     
     model = MobileCLIPRanker(cfg).to(device)
-    model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+    
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
     
     param_groups = [
         {'params': model.module.backbone.parameters(), 'lr': cfg.train.lr_backbone},
