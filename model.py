@@ -10,18 +10,17 @@ class MobileCLIPRanker(nn.Module):
         self.backbone = full_model.image_encoder
         
         for param in self.backbone.parameters():
-            param.requires_grad = False
+            param.requires_grad = True
             
         with torch.no_grad():
-            self.backbone.eval()
             dummy = torch.zeros(1, 3, cfg.data.img_size, cfg.data.img_size)
             dim = self.backbone(dummy).shape[1]
             
         self.score_head = nn.Sequential(
+            nn.Dropout(0.2),
             nn.Linear(dim, cfg.model.head_hidden_dim),
-            nn.LayerNorm(cfg.model.head_hidden_dim), 
+            nn.LayerNorm(cfg.model.head_hidden_dim),
             nn.GELU(),
-            nn.Dropout(0.1),
             nn.Linear(cfg.model.head_hidden_dim, 1)
         )
         
@@ -33,15 +32,8 @@ class MobileCLIPRanker(nn.Module):
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
 
-    def train(self, mode=True):
-        super().train(mode)
-        self.backbone.eval() 
-        return self
-
     def forward(self, x):
-        self.backbone.eval()
-        with torch.no_grad():
-            features = self.backbone(x)
-            features = features / features.norm(dim=-1, keepdim=True)
+
+        features = self.backbone(x)
         
         return self.score_head(features)

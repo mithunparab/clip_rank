@@ -1,7 +1,6 @@
 import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -21,23 +20,12 @@ def setup_ddp():
 def cleanup_ddp():
     dist.destroy_process_group()
 
-def weighted_bradley_terry_loss(s_win, s_lose, weights):
-    diff = s_win - s_lose
-    
-    loss = F.softplus(-diff)
-    
-    weights = torch.clamp(weights, min=1.0, max=5.0)
-    
-    weighted_loss = loss * weights
-    return weighted_loss.mean()
-
-def train_epoch(model, loader, optimizer, device):
+def train_epoch(model, loader, criterion, optimizer, device):
     model.train() 
     total_loss = torch.zeros(1).to(device)
     
     for win_img, lose_img, weights in loader:
         win_img, lose_img = win_img.to(device), lose_img.to(device)
-        weights = weights.to(device)
         
         optimizer.zero_grad()
         
@@ -48,7 +36,8 @@ def train_epoch(model, loader, optimizer, device):
         s_win = s_win.view(-1)
         s_lose = s_lose.view(-1)
         
-        loss = weighted_bradley_terry_loss(s_win, s_lose, weights)
+        target = torch.ones(s_win.size(0)).to(device)
+        loss = criterion(s_win, s_lose, target)
         
         loss.backward()
         optimizer.step()
@@ -120,25 +109,33 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=cfg.train.batch_size, sampler=train_sampler, num_workers=cfg.system.num_workers, pin_memory=cfg.system.pin_memory)
     
     model = MobileCLIPRanker(cfg).to(device)
+    # find_unused_parameters=False is safe now as we use the whole image encoder
     model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
     
-    optimizer = optim.AdamW(model.module.score_head.parameters(), 
-                           lr=cfg.train.lr_head, 
-                           weight_decay=cfg.train.weight_decay)
+    # --- Fine-Tuning Optimizer Setup ---
+    param_groups = [
+        # Backbone gets tiny LR
+        {'params': model.module.backbone.parameters(), 'lr': cfg.train.lr_backbone},
+        # Head gets higher LR
+        {'params': model.module.score_head.parameters(), 'lr': cfg.train.lr_head}
+    ]
+    
+    optimizer = optim.AdamW(param_groups, weight_decay=cfg.train.weight_decay)
+    criterion = nn.MarginRankingLoss(margin=cfg.train.margin)
     
     if local_rank == 0:
-        print(f"--- Training Head Only: LR={cfg.train.lr_head} ---")
+        print(f"--- Fine-Tuning Backbone (LR={cfg.train.lr_backbone}) + Head (LR={cfg.train.lr_head}) ---")
 
     for epoch in range(cfg.train.epochs):
         train_sampler.set_epoch(epoch)
-        loss = train_epoch(model, train_loader, optimizer, device)
+        loss = train_epoch(model, train_loader, criterion, optimizer, device)
         
         if local_rank == 0:
             print(f"Epoch {epoch+1}/{cfg.train.epochs} | Loss: {loss:.4f}")
             acc = validate(model, val_df, cfg, device)
             print(f"Epoch {epoch+1} | Val Accuracy: {acc:.4f}")
             
-            if acc > 0.5:
+            if acc > 0.50:
                 torch.save(model.module.state_dict(), f"checkpoint_epoch_{epoch+1}.pth")
 
     cleanup_ddp()
