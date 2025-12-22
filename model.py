@@ -8,19 +8,37 @@ class MobileCLIPRanker(nn.Module):
         super().__init__()
         
         full_model, _, _ = mobileclip.create_model_and_transforms(cfg.model.name)
+        tokenizer = mobileclip.get_tokenizer(cfg.model.name)
+        
         self.backbone = full_model.image_encoder
         
         for param in self.backbone.parameters():
             param.requires_grad = True
             
-        with torch.no_grad():
-            dummy = torch.zeros(1, 3, cfg.data.img_size, cfg.data.img_size)
-            dim = self.backbone(dummy).shape[1]
+        prompts = [
+            "wide angle photo of an empty room with large open floor space",
             
-        self.anchors = nn.Parameter(torch.randn(cfg.model.num_anchors, dim))
-        nn.init.orthogonal_(self.anchors)
+            "room with large blank empty walls and visible corners",
+            
+            "empty bedroom with a large window and clear floor area",
+            
+            "spacious living room with a fireplace and high ceiling",
+            
+            "perspective view of a long room with depth and hardwood floor"
+        ]
         
-        self.scale = 20.0
+        print(f"Initializing {len(prompts)} Stager-Centric Anchors...")
+        
+        with torch.no_grad():
+            text_tokens = tokenizer(prompts)
+            anchor_feats = full_model.text_encoder(text_tokens)
+            anchor_feats = F.normalize(anchor_feats, dim=-1)
+            
+        self.anchors = nn.Parameter(anchor_feats.float())
+        
+        del full_model.text_encoder
+        
+        self.logit_scale = nn.Parameter(torch.ones([]) * 4.6052)
 
     def forward(self, x):
         img_feats = self.backbone(x)
@@ -30,6 +48,8 @@ class MobileCLIPRanker(nn.Module):
         
         sims = img_feats @ anchor_feats.T
         
+        sims = sims * self.logit_scale.exp()
+        
         best_sim, _ = sims.max(dim=1)
         
-        return best_sim * self.scale
+        return torch.sigmoid(best_sim - 12.0)

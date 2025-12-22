@@ -20,25 +20,19 @@ def setup_ddp():
 def cleanup_ddp():
     dist.destroy_process_group()
 
-def train_epoch(model, loader, criterion, optimizer, device):
+def train_epoch(model, loader, optimizer, device):
     model.train() 
     total_loss = torch.zeros(1).to(device)
     
-    for win_img, lose_img in loader:
-        win_img, lose_img = win_img.to(device), lose_img.to(device)
+    for imgs, scores in loader:
+        imgs = imgs.to(device)
+        scores = scores.to(device) 
         
         optimizer.zero_grad()
         
-        batch = torch.cat([win_img, lose_img], dim=0)
-        scores = model(batch)
-        s_win, s_lose = torch.split(scores, win_img.size(0), dim=0)
+        preds = model(imgs)
         
-        s_win = s_win.view(-1)
-        s_lose = s_lose.view(-1)
-        
-        target = torch.ones_like(s_win)
-        
-        loss = criterion(s_win, s_lose, target)
+        loss = nn.MSELoss()(preds, scores)
         
         loss.backward()
         optimizer.step()
@@ -87,7 +81,6 @@ def validate(model, df_val, cfg, device):
                 correct_strict += 1
             if score_of_chosen >= (max_gt_score - 1.0):
                 correct_relaxed += 1
-                
             total += 1
             
     if total == 0: return 0, 0
@@ -120,25 +113,23 @@ def main():
     
     param_groups = [
         {'params': model.module.backbone.parameters(), 'lr': cfg.train.lr_backbone},
-        {'params': [model.module.anchors], 'lr': cfg.train.lr_anchor}
+        {'params': [model.module.anchors, model.module.logit_scale], 'lr': cfg.train.lr_anchor}
     ]
     
     optimizer = optim.AdamW(param_groups, weight_decay=cfg.train.weight_decay)
-    
-    criterion = nn.MarginRankingLoss(margin=cfg.train.margin)
 
     if local_rank == 0:
-        print(f"--- Training Discriminative Prototypes (RankLoss on Multi-Head) ---")
+        print(f"--- Training Semantic Anchors (Text Init) ---")
 
     for epoch in range(cfg.train.epochs):
         train_sampler.set_epoch(epoch)
-        loss = train_epoch(model, train_loader, criterion, optimizer, device)
+        loss = train_epoch(model, train_loader, optimizer, device)
         
         if local_rank == 0:
             strict, relaxed = validate(model, val_df, cfg, device)
             print(f"Epoch {epoch+1} | Loss: {loss:.4f} | Strict: {strict:.4f} | Relaxed: {relaxed:.4f}")
             
-            if strict > 0.50:
+            if strict > 0.40:
                 torch.save(model.module.state_dict(), f"checkpoint_epoch_{epoch+1}.pth")
 
     cleanup_ddp()
