@@ -3,23 +3,30 @@ from torch.utils.data import Dataset
 import pandas as pd
 import os
 from PIL import Image
-import mobileclip
 from torchvision import transforms
+from torchvision.transforms import InterpolationMode
 
 class PropertyPreferenceDataset(Dataset):
-    def __init__(self, csv_path_or_df, model_name='mobileclip_b', pretrained_path=None, img_size=224, is_train=False):
-        _, _, self.preprocess = mobileclip.create_model_and_transforms(model_name, pretrained=pretrained_path)
+    def __init__(self, csv_path_or_df, model_name='mobileclip_b', pretrained_path=None, img_size=336, is_train=False):
         self.img_size = img_size
         self.is_train = is_train
         self.data = []
         
+        mean = (0.485, 0.456, 0.406)
+        std = (0.229, 0.224, 0.225)
+        
         if is_train:
-            self.aug = transforms.Compose([
+            self.transform = transforms.Compose([
                 transforms.RandomHorizontalFlip(p=0.5),
                 transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.05),
+                transforms.ToTensor(),
+                transforms.Normalize(mean, std)
             ])
         else:
-            self.aug = None
+            self.transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(mean, std)
+            ])
 
         if isinstance(csv_path_or_df, str):
             df = pd.read_csv(csv_path_or_df)
@@ -42,21 +49,19 @@ class PropertyPreferenceDataset(Dataset):
         try:
             img = Image.open(path).convert('RGB')
         except:
-            return Image.new('RGB', (self.img_size, self.img_size))
+            return torch.zeros(3, self.img_size, self.img_size)
         
-        if self.is_train and self.aug:
-            img = self.aug(img)
-            return self.preprocess(img)
-            
         w, h = img.size
         scale = self.img_size / max(h, w)
         new_w, new_h = int(w * scale), int(h * scale)
-        img_resized = img.resize((new_w, new_h), Image.Resampling.BILINEAR)
+        
+        img_resized = img.resize((new_w, new_h), Image.Resampling.BICUBIC)
+        
         background = Image.new('RGB', (self.img_size, self.img_size), (0, 0, 0))
         offset = ((self.img_size - new_w) // 2, (self.img_size - new_h) // 2)
         background.paste(img_resized, offset)
         
-        return self.preprocess(background)
+        return self.transform(background)
 
     def __getitem__(self, idx):
         item = self.data[idx]

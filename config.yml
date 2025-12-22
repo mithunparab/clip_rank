@@ -6,7 +6,7 @@ system:
 data:
   csv_path: "dataset.csv"
   images_dir: "images"
-  img_size: 224
+  img_size: 336
   val_fold: 0
 
 model:
@@ -14,11 +14,9 @@ model:
   num_anchors: 5
 
 train:
-  batch_size: 32
-
-  lr_backbone: 5.0e-6   
-  lr_anchor: 1.0e-3
-  epochs: 15
+  batch_size: 16       
+  lr_backbone: 2.0e-6  
+  lr_anchor: 1.0e-3    
+  epochs: 20
   weight_decay: 0.01
-  margin: 0.2           
   seed: 42

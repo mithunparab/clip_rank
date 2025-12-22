@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import mobileclip
+import math
 
 class MobileCLIPRanker(nn.Module):
     def __init__(self, cfg):
@@ -17,17 +18,11 @@ class MobileCLIPRanker(nn.Module):
             
         prompts = [
             "wide angle photo of an empty room with large open floor space",
-            
             "room with large blank empty walls and visible corners",
-            
             "empty bedroom with a large window and clear floor area",
-            
             "spacious living room with a fireplace and high ceiling",
-            
             "perspective view of a long room with depth and hardwood floor"
         ]
-        
-        print(f"Initializing {len(prompts)} Stager-Centric Anchors...")
         
         with torch.no_grad():
             text_tokens = tokenizer(prompts)
@@ -35,19 +30,18 @@ class MobileCLIPRanker(nn.Module):
             anchor_feats = F.normalize(anchor_feats, dim=-1)
             
         self.anchors = nn.Parameter(anchor_feats.float())
-        
         del full_model.text_encoder
         
         self.logit_scale = nn.Parameter(torch.ones([]) * 4.6052)
 
     def forward(self, x):
+        
         img_feats = self.backbone(x)
         img_feats = F.normalize(img_feats, dim=-1)
         
         anchor_feats = F.normalize(self.anchors, dim=-1)
         
         sims = img_feats @ anchor_feats.T
-        
         sims = sims * self.logit_scale.exp()
         
         best_sim, _ = sims.max(dim=1)
