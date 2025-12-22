@@ -30,7 +30,7 @@ def train_epoch(model, loader, optimizer, device):
         
         optimizer.zero_grad()
         
-        preds = model(imgs)
+        preds = model(imgs).squeeze(-1) 
         
         loss = nn.MSELoss()(preds, scores)
         
@@ -81,6 +81,7 @@ def validate(model, df_val, cfg, device):
                 correct_strict += 1
             if score_of_chosen >= (max_gt_score - 1.0):
                 correct_relaxed += 1
+                
             total += 1
             
     if total == 0: return 0, 0
@@ -113,13 +114,13 @@ def main():
     
     param_groups = [
         {'params': model.module.backbone.parameters(), 'lr': cfg.train.lr_backbone},
-        {'params': [model.module.anchors, model.module.logit_scale], 'lr': cfg.train.lr_anchor}
+        {'params': model.module.score_head.parameters(), 'lr': cfg.train.lr_head}
     ]
     
     optimizer = optim.AdamW(param_groups, weight_decay=cfg.train.weight_decay)
 
     if local_rank == 0:
-        print(f"--- Training Semantic Anchors (Text Init) ---")
+        print(f"--- Training Semantic Regressor (336px) ---")
 
     for epoch in range(cfg.train.epochs):
         train_sampler.set_epoch(epoch)
@@ -129,7 +130,7 @@ def main():
             strict, relaxed = validate(model, val_df, cfg, device)
             print(f"Epoch {epoch+1} | Loss: {loss:.4f} | Strict: {strict:.4f} | Relaxed: {relaxed:.4f}")
             
-            if strict > 0.40:
+            if strict > 0.45:
                 torch.save(model.module.state_dict(), f"checkpoint_epoch_{epoch+1}.pth")
 
     cleanup_ddp()

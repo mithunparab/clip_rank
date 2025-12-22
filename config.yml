@@ -15,8 +15,8 @@ model:
 
 train:
   batch_size: 16       
-  lr_backbone: 2.0e-6  
-  lr_anchor: 1.0e-3    
+  lr_backbone: 5.0e-6  
+  lr_head: 1.0e-3      
   epochs: 20
   weight_decay: 0.01
   seed: 42
