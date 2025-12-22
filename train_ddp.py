@@ -20,19 +20,25 @@ def setup_ddp():
 def cleanup_ddp():
     dist.destroy_process_group()
 
-def train_epoch(model, loader, optimizer, device):
+def train_epoch(model, loader, criterion, optimizer, device):
     model.train() 
     total_loss = torch.zeros(1).to(device)
     
-    for imgs, scores in loader:
-        imgs = imgs.to(device)
-        scores = scores.to(device) 
+    for win_img, lose_img in loader:
+        win_img, lose_img = win_img.to(device), lose_img.to(device)
         
         optimizer.zero_grad()
         
-        preds = model(imgs)
+        batch = torch.cat([win_img, lose_img], dim=0)
+        scores = model(batch)
+        s_win, s_lose = torch.split(scores, win_img.size(0), dim=0)
         
-        loss = nn.MSELoss()(preds, scores)
+        s_win = s_win.view(-1)
+        s_lose = s_lose.view(-1)
+        
+        target = torch.ones_like(s_win)
+        
+        loss = criterion(s_win, s_lose, target)
         
         loss.backward()
         optimizer.step()
@@ -71,7 +77,6 @@ def validate(model, df_val, cfg, device):
                 gt_scores.append(r['score'])
             
             batch = torch.stack(batch_tensors).to(device)
-            
             pred_scores = model(batch).squeeze().cpu().numpy()
             
             pred_winner_idx = np.argmax(pred_scores)
@@ -111,28 +116,29 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=cfg.train.batch_size, sampler=train_sampler, num_workers=cfg.system.num_workers, pin_memory=cfg.system.pin_memory)
     
     model = MobileCLIPRanker(cfg).to(device)
-    
     model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
     
     param_groups = [
         {'params': model.module.backbone.parameters(), 'lr': cfg.train.lr_backbone},
-        {'params': [model.module.quality_anchor], 'lr': cfg.train.lr_anchor}
+        {'params': [model.module.anchors], 'lr': cfg.train.lr_anchor}
     ]
     
     optimizer = optim.AdamW(param_groups, weight_decay=cfg.train.weight_decay)
+    
+    criterion = nn.MarginRankingLoss(margin=cfg.train.margin)
 
     if local_rank == 0:
-        print(f"--- Training Concept Alignment (Clustering) ---")
+        print(f"--- Training Discriminative Prototypes (RankLoss on Multi-Head) ---")
 
     for epoch in range(cfg.train.epochs):
         train_sampler.set_epoch(epoch)
-        loss = train_epoch(model, train_loader, optimizer, device)
+        loss = train_epoch(model, train_loader, criterion, optimizer, device)
         
         if local_rank == 0:
             strict, relaxed = validate(model, val_df, cfg, device)
             print(f"Epoch {epoch+1} | Loss: {loss:.4f} | Strict: {strict:.4f} | Relaxed: {relaxed:.4f}")
             
-            if strict > 0.45:
+            if strict > 0.50:
                 torch.save(model.module.state_dict(), f"checkpoint_epoch_{epoch+1}.pth")
 
     cleanup_ddp()

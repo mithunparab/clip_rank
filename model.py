@@ -18,8 +18,9 @@ class MobileCLIPRanker(nn.Module):
             dim = self.backbone(dummy).shape[1]
             
         self.anchors = nn.Parameter(torch.randn(cfg.model.num_anchors, dim))
-        
         nn.init.orthogonal_(self.anchors)
+        
+        self.scale = 20.0
 
     def forward(self, x):
         img_feats = self.backbone(x)
@@ -31,4 +32,4 @@ class MobileCLIPRanker(nn.Module):
         
         best_sim, _ = sims.max(dim=1)
         
-        return best_sim
+        return best_sim * self.scale

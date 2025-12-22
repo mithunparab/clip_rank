@@ -11,7 +11,7 @@ class PropertyPreferenceDataset(Dataset):
         _, _, self.preprocess = mobileclip.create_model_and_transforms(model_name, pretrained=pretrained_path)
         self.img_size = img_size
         self.is_train = is_train
-        self.data = []
+        self.pairs = []
         
         if is_train:
             self.aug = transforms.Compose([
@@ -30,14 +30,26 @@ class PropertyPreferenceDataset(Dataset):
 
         df['file_path'] = df.index.map(lambda x: f"images/{x}.jpg")
         df = df[df['file_path'].apply(os.path.exists)]
-        
-        for _, row in df.iterrows():
-            self.data.append({
-                'path': row['file_path'],
-                'score': float(row['score']) / 10.0,
-                'raw_score': row['score'],
-                'group': row['group_id'] 
-            })
+
+        if 'group_id' in df.columns and 'label' in df.columns:
+            groups = df.groupby(['group_id', 'label'])
+            
+            for _, group in groups:
+                records = group.to_dict('records')
+                n = len(records)
+                if n < 2: continue
+                    
+                for i in range(n):
+                    for j in range(n):
+                        if i == j: continue
+                        score_a = records[i]['score']
+                        score_b = records[j]['score']
+                        
+                        if score_a >= score_b + 0.5:
+                            self.pairs.append({
+                                'win_path': records[i]['file_path'],
+                                'lose_path': records[j]['file_path']
+                            })
 
     def _load_local(self, path):
         try:
@@ -60,9 +72,10 @@ class PropertyPreferenceDataset(Dataset):
         return self.preprocess(background)
 
     def __getitem__(self, idx):
-        item = self.data[idx]
-        img_tensor = self._load_local(item['path'])
-        return img_tensor, torch.tensor(item['score'], dtype=torch.float32)
+        item = self.pairs[idx]
+        win_tensor = self._load_local(item['win_path'])
+        lose_tensor = self._load_local(item['lose_path'])
+        return win_tensor, lose_tensor
 
     def __len__(self):
-        return len(self.data)
+        return len(self.pairs)
