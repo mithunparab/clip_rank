@@ -20,19 +20,27 @@ def setup_ddp():
 def cleanup_ddp():
     dist.destroy_process_group()
 
-def train_epoch(model, loader, optimizer, device):
+def train_epoch(model, loader, criterion, optimizer, device):
     model.train() 
     total_loss = torch.zeros(1).to(device)
     
-    for imgs, scores in loader:
-        imgs = imgs.to(device)
-        scores = scores.to(device) 
+    for img_stack, target_idx, mask in loader:
+        
+        B, G, C, H, W = img_stack.shape
+        
+        flat_imgs = img_stack.view(B * G, C, H, W).to(device)
+        target_idx = target_idx.to(device)
+        mask = mask.to(device)
         
         optimizer.zero_grad()
         
-        preds = model(imgs).squeeze(-1) 
+        flat_scores = model(flat_imgs)
         
-        loss = nn.MSELoss()(preds, scores)
+        scores = flat_scores.view(B, G)
+        
+        scores = scores.masked_fill(mask == 0, -1e9)
+        
+        loss = criterion(scores, target_idx)
         
         loss.backward()
         optimizer.step()
@@ -50,7 +58,8 @@ def validate(model, df_val, cfg, device):
     ds_helper = PropertyPreferenceDataset(pd.DataFrame(), 
                                           model_name=cfg.model.name, 
                                           img_size=cfg.data.img_size,
-                                          is_train=False)
+                                          is_train=False,
+                                          max_group_size=20) 
     
     df_val = df_val.copy()
     df_val['file_path'] = df_val.index.map(lambda x: f"{cfg.data.images_dir}/{x}.jpg")
@@ -105,12 +114,13 @@ def main():
     train_df = df.iloc[train_idx]
     val_df = df.iloc[val_idx]
     
-    train_ds = PropertyPreferenceDataset(train_df, model_name=cfg.model.name, img_size=cfg.data.img_size, is_train=True)
+    train_ds = PropertyPreferenceDataset(train_df, model_name=cfg.model.name, img_size=cfg.data.img_size, is_train=True, max_group_size=cfg.data.max_group_size)
+    
     train_sampler = DistributedSampler(train_ds, shuffle=True)
     train_loader = DataLoader(train_ds, batch_size=cfg.train.batch_size, sampler=train_sampler, num_workers=cfg.system.num_workers, pin_memory=cfg.system.pin_memory)
     
     model = MobileCLIPRanker(cfg).to(device)
-    model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
     
     param_groups = [
         {'params': model.module.backbone.parameters(), 'lr': cfg.train.lr_backbone},
@@ -118,13 +128,15 @@ def main():
     ]
     
     optimizer = optim.AdamW(param_groups, weight_decay=cfg.train.weight_decay)
+    
+    criterion = nn.CrossEntropyLoss()
 
     if local_rank == 0:
-        print(f"--- Training Semantic Regressor (336px) ---")
+        print(f"--- Training Listwise Ranking (Softmax) ---")
 
     for epoch in range(cfg.train.epochs):
         train_sampler.set_epoch(epoch)
-        loss = train_epoch(model, train_loader, optimizer, device)
+        loss = train_epoch(model, train_loader, criterion, optimizer, device)
         
         if local_rank == 0:
             strict, relaxed = validate(model, val_df, cfg, device)

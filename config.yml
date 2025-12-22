@@ -8,15 +8,16 @@ data:
   images_dir: "images"
   img_size: 336
   val_fold: 0
+  max_group_size: 6   
 
 model:
   name: "mobileclip_b"
-  num_anchors: 5
+  head_hidden_dim: 512
 
 train:
-  batch_size: 16       
-  lr_backbone: 5.0e-6  
-  lr_head: 1.0e-3      
-  epochs: 20
-  weight_decay: 0.01
+  batch_size: 4       
+  lr_backbone: 5.0e-6
+  lr_head: 5.0e-4    
+  epochs: 15
+  weight_decay: 0.05
   seed: 42
