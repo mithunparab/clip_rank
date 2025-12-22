@@ -22,7 +22,7 @@ class PropertyRanker:
         self.cfg = load_config(config_path)
         self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
         
-        print(f"Loading Semantic Anchor Model on {self.device}...")
+        print(f"Loading Contrastive Model on {self.device}...")
 
         self.model = MobileCLIPRanker(self.cfg)
         
@@ -49,7 +49,7 @@ class PropertyRanker:
         w, h = img.size
         scale = target_size / max(h, w)
         new_w, new_h = int(w * scale), int(h * scale)
-        img_resized = img.resize((new_w, new_h), Image.Resampling.BILINEAR)
+        img_resized = img.resize((new_w, new_h), Image.Resampling.BICUBIC)
         background = Image.new('RGB', (target_size, target_size), (0, 0, 0))
         offset = ((target_size - new_w) // 2, (target_size - new_h) // 2)
         background.paste(img_resized, offset)
@@ -86,10 +86,12 @@ class PropertyRanker:
 if __name__ == "__main__":
     import glob
     checkpoints = sorted(glob.glob("checkpoint_epoch_*.pth"), key=os.path.getmtime)
+    
     if not checkpoints:
-        print("No checkpoints found.")
+        print("No checkpoints found. Training did not hit >60% relaxed accuracy.")
         exit()
     
+    print(f"Using checkpoint: {checkpoints[-1]}")
     ranker = PropertyRanker(model_path=checkpoints[-1])
     
     test_urls = [
