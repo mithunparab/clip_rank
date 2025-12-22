@@ -6,16 +6,17 @@ system:
 data:
   csv_path: "dataset.csv"
   images_dir: "images"
-  img_size: 336
+  img_size: 336        
   val_fold: 0
 
 model:
   name: "mobileclip_b"
+  num_anchors: 5      
 
 train:
   batch_size: 16
   lr_backbone: 2.0e-6  
-  lr_head: 1.0e-2
-  epochs: 15
+  lr_head: 5.0e-3     
+  epochs: 20
   weight_decay: 0.01
   seed: 42

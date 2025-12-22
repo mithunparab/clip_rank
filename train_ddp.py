@@ -114,13 +114,13 @@ def main():
     
     param_groups = [
         {'params': model.module.backbone.parameters(), 'lr': cfg.train.lr_backbone},
-        {'params': [model.module.scale, model.module.bias], 'lr': cfg.train.lr_head}
+        {'params': [model.module.anchors, model.module.scale, model.module.bias], 'lr': cfg.train.lr_head}
     ]
     
     optimizer = optim.AdamW(param_groups, weight_decay=cfg.train.weight_decay)
 
     if local_rank == 0:
-        print(f"--- Training Contrastive Anchors (Good - Bad) ---")
+        print(f"--- Training Learned Multi-Head Clusters ---")
 
     for epoch in range(cfg.train.epochs):
         train_sampler.set_epoch(epoch)
@@ -130,7 +130,7 @@ def main():
             strict, relaxed = validate(model, val_df, cfg, device)
             print(f"Epoch {epoch+1} | Loss: {loss:.4f} | Strict: {strict:.4f} | Relaxed: {relaxed:.4f}")
             
-            if relaxed > 0.60:
+            if relaxed > 0.65:
                 torch.save(model.module.state_dict(), f"checkpoint_epoch_{epoch+1}.pth")
 
     cleanup_ddp()
