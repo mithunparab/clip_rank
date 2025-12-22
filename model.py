@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import mobileclip
-import math
 
 class MobileCLIPRanker(nn.Module):
     def __init__(self, cfg):
@@ -29,21 +28,26 @@ class MobileCLIPRanker(nn.Module):
             anchor_feats = full_model.text_encoder(text_tokens)
             anchor_feats = F.normalize(anchor_feats, dim=-1)
             
-        self.anchors = nn.Parameter(anchor_feats.float())
+        self.register_buffer("anchors", anchor_feats.float())
+        
+
+        self.score_head = nn.Sequential(
+            nn.Linear(len(prompts), 1),
+            nn.Sigmoid() 
+        )
+        
         del full_model.text_encoder
         
-        self.logit_scale = nn.Parameter(torch.ones([]) * 4.6052)
+        self.logit_scale = nn.Parameter(torch.ones([]) * 100.0) 
 
     def forward(self, x):
-        
         img_feats = self.backbone(x)
         img_feats = F.normalize(img_feats, dim=-1)
         
-        anchor_feats = F.normalize(self.anchors, dim=-1)
+        anchor_feats = self.anchors
         
         sims = img_feats @ anchor_feats.T
-        sims = sims * self.logit_scale.exp()
         
-        best_sim, _ = sims.max(dim=1)
+        score = self.score_head(sims * 10.0) 
         
-        return torch.sigmoid(best_sim - 12.0)
+        return score
