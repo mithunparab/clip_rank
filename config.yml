@@ -1,11 +1,12 @@
 system:
   num_workers: 4
   pin_memory: true
+  ddp: true
 
 data:
-  csv_path: "dataset.csv"  
+  csv_path: "dataset.csv"
   img_size: 336
-  val_fold: 0            
+  val_fold: 0
 
 model:
   name: "mobileclip_b"
@@ -15,8 +16,9 @@ model:
 train:
   batch_size: 16          
   lr_backbone: 1.0e-6     
-  lr_head: 1.0e-4         
+  lr_head: 2.0e-4         
   epochs: 30
-  weight_decay: 0.01
+  weight_decay: 0.05
   grad_clip: 1.0
   save_dir: "./checkpoints"
+  seed: 42
