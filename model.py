@@ -1,12 +1,11 @@
 import torch
 import torch.nn as nn
-import os
 import mobileclip
 from huggingface_hub import hf_hub_download
 
 class MobileCLIPRanker(nn.Module):
     def __init__(self, cfg):
-        super().__init__()
+        super().__inait__()
         
         ckpt_path = self._download_weights(cfg.model.name)
         print(f"Loading Backbone from {ckpt_path}...")
@@ -17,16 +16,22 @@ class MobileCLIPRanker(nn.Module):
         self.backbone = model.image_encoder
         self.backbone_dim = 512 
         
-        self.backbone.eval()
         for param in self.backbone.parameters():
             param.requires_grad = False
             
+        params = list(self.backbone.named_parameters())
+        num_to_unfreeze = int(len(params) * 0.2)
+        print(f"Unfreezing top {num_to_unfreeze} layers for fine-tuning...")
+        
+        for name, param in params[-num_to_unfreeze:]:
+            param.requires_grad = True
+
         self.head = nn.Sequential(
             nn.Dropout(p=cfg.model.dropout),
             nn.Linear(self.backbone_dim, cfg.model.head_hidden_dim),
             nn.LayerNorm(cfg.model.head_hidden_dim),
             nn.GELU(),
-            nn.Linear(cfg.model.head_hidden_dim, 1) 
+            nn.Linear(cfg.model.head_hidden_dim, 1)
         )
         
         self.apply(self._init_weights)
@@ -36,8 +41,8 @@ class MobileCLIPRanker(nn.Module):
         filename = "mobileclip_b.pt"
         try:
             return hf_hub_download(repo_id=repo_id, filename=filename)
-        except:
-            raise RuntimeError("Failed to download MobileCLIP weights")
+        except Exception as e:
+            raise RuntimeError(f"Weights download failed: {e}")
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -46,21 +51,16 @@ class MobileCLIPRanker(nn.Module):
 
     def train(self, mode=True):
         super().train(mode)
-        self.backbone.eval()
+        self.backbone.eval() 
         return self
 
     def forward(self, x):
-        # Listwise Input: [Batch, GroupSize, 3, H, W]
         b, g, c, h, w = x.shape
         
-        # Flatten: [B*G, 3, H, W]
         x_flat = x.view(b * g, c, h, w)
         
-        with torch.no_grad():
-            features = self.backbone(x_flat) # [B*G, 512]
-            
-        scores = self.head(features) # [B*G, 1]
+        features = self.backbone(x_flat)
         
-        # Reshape: [Batch, GroupSize]
-        scores = scores.view(b, g)
-        return scores
+        scores = self.head(features)
+        
+        return scores.view(b, g)

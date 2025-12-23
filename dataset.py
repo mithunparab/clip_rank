@@ -7,7 +7,7 @@ import os
 import numpy as np
 
 class PropertyPreferenceDataset(Dataset):
-    def __init__(self, df, images_dir="images", is_train=False, img_size=336, max_len=15):
+    def __init__(self, df, images_dir="images", is_train=False, img_size=336, max_len=12):
         self.img_size = img_size
         self.max_len = max_len
         self.images_dir = images_dir
@@ -29,8 +29,7 @@ class PropertyPreferenceDataset(Dataset):
             grouped = self.df.groupby('group_id')
             for g_id, group in grouped:
                 if len(group) < 2: continue
-                records = group.to_dict('records')
-                self.groups.append(records)
+                self.groups.append(group.to_dict('records'))
 
     def _letterbox_image(self, img_path):
         try:
@@ -40,6 +39,7 @@ class PropertyPreferenceDataset(Dataset):
                 scale = self.img_size / max(w, h)
                 new_w, new_h = int(w * scale), int(h * scale)
                 img_resized = img.resize((new_w, new_h), Image.Resampling.BICUBIC)
+                
                 canvas = Image.new('RGB', (self.img_size, self.img_size), (0, 0, 0))
                 x_offset = (self.img_size - new_w) // 2
                 y_offset = (self.img_size - new_h) // 2
@@ -53,13 +53,14 @@ class PropertyPreferenceDataset(Dataset):
 
     def __getitem__(self, idx):
         records = self.groups[idx]
+        
         current_len = min(len(records), self.max_len)
-        selected_records = records[:current_len]
+        selected = records[:current_len]
         
         image_tensors = []
         scores = []
         
-        for r in selected_records:
+        for r in selected:
             img = self._letterbox_image(r['file_path'])
             t_img = transforms.functional.to_tensor(img)
             t_img = self.normalize(t_img)
@@ -70,9 +71,8 @@ class PropertyPreferenceDataset(Dataset):
         if pad_len > 0:
             for _ in range(pad_len):
                 image_tensors.append(torch.zeros(3, self.img_size, self.img_size))
-                scores.append(-1e9) 
+                scores.append(-1e9)
         
-        # stack into [MaxLen, 3, H, W]
         img_stack = torch.stack(image_tensors)
         score_stack = torch.tensor(scores, dtype=torch.float32)
         

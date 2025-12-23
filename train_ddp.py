@@ -30,17 +30,15 @@ def cleanup_ddp():
     if dist.is_initialized(): dist.destroy_process_group()
 
 def listnet_loss(pred_scores, gt_scores, mask, temperature=1.0):
-    """
-    Listwise Loss using KL Divergence.
-    gt_scores: [B, 15] (e.g., 10, 9, 2, -1e9...)
-    pred_scores: [B, 15] (logits)
-    """
+    gt_scores = gt_scores.clone()
+    gt_scores[mask == 0] = -1e9
     
     gt_probs = F.softmax(gt_scores / temperature, dim=1)
     
+    pred_scores = pred_scores.clone()
+    pred_scores[mask == 0] = -1e9
     pred_log_probs = F.log_softmax(pred_scores, dim=1)
-
-    # -Sum( P_gt * log(P_pred) )
+    
     loss = -torch.sum(gt_probs * pred_log_probs, dim=1)
     
     return loss.mean()
@@ -85,9 +83,7 @@ def validate(model, df_val, cfg, device):
             max_gt_score = max(gt_scores)
             
             if score_of_model_choice == max_gt_score: strict_wins += 1
-            
             if score_of_model_choice >= (max_gt_score - 1.0): relaxed_wins += 1
-            
             total_groups += 1
             
     if total_groups == 0: return 0.0, 0.0
@@ -117,7 +113,7 @@ def main():
     
     train_loader = DataLoader(
         train_ds, 
-        batch_size=cfg.train.batch_size,
+        batch_size=cfg.train.batch_size, 
         sampler=sampler, 
         num_workers=cfg.system.num_workers, 
         pin_memory=cfg.system.pin_memory, 
@@ -129,12 +125,18 @@ def main():
     model = MobileCLIPRanker(cfg).to(device)
     
     if dist.is_initialized():
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
     
-    optimizer = optim.AdamW(model.module.head.parameters(), lr=cfg.train.lr_head, weight_decay=cfg.train.weight_decay)
+    backbone_params = [p for n, p in model.module.backbone.named_parameters() if p.requires_grad]
+    head_params = list(model.module.head.parameters())
+    
+    optimizer = optim.AdamW([
+        {'params': backbone_params, 'lr': cfg.train.lr_backbone},
+        {'params': head_params, 'lr': cfg.train.lr_head}
+    ], weight_decay=cfg.train.weight_decay)
     
     if rank == 0:
-        print(f"Listwise Training on {len(train_ds)} properties (Frozen Backbone).")
+        print(f"Training on {len(train_ds)} properties using ListNet Loss.")
 
     for epoch in range(cfg.train.epochs):
         if dist.is_initialized(): sampler.set_epoch(epoch)
@@ -144,15 +146,14 @@ def main():
         iterator = tqdm(train_loader, desc=f"Epoch {epoch+1}") if rank == 0 else train_loader
         
         for img_stack, score_stack, mask in iterator:
-            img_stack = img_stack.to(device)     # [B, 15, 3, 336, 336]
-            score_stack = score_stack.to(device) # [B, 15]
+            img_stack = img_stack.to(device)
+            score_stack = score_stack.to(device)
             mask = mask.to(device)
             
             optimizer.zero_grad()
             
-            pred_scores = model(img_stack)       # [B, 15]
+            pred_scores = model(img_stack)
             
-            # Listwise Loss
             loss = listnet_loss(pred_scores, score_stack, mask, temperature=cfg.train.gt_temperature)
             
             loss.backward()
