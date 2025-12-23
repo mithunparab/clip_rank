@@ -21,9 +21,7 @@ class MobileCLIPRanker(nn.Module):
             nn.Linear(dim, cfg.model.head_hidden_dim),
             nn.LayerNorm(cfg.model.head_hidden_dim),
             nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(cfg.model.head_hidden_dim, 1),
-            nn.Sigmoid() 
+            nn.Linear(cfg.model.head_hidden_dim, 1)
         )
         
         self.apply(self._init_weights)

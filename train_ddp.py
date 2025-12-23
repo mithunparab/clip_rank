@@ -24,17 +24,24 @@ def train_epoch(model, loader, optimizer, device):
     model.train() 
     total_loss = torch.zeros(1).to(device)
     
-    criterion = nn.HuberLoss(delta=0.1) 
+    criterion = nn.MSELoss()
     
-    for imgs, scores in loader:
-        imgs = imgs.to(device)
-        scores = scores.to(device) 
+    for win_img, lose_img, target_diff in loader:
+        win_img, lose_img = win_img.to(device), lose_img.to(device)
+        target_diff = target_diff.to(device) # 0.0 to 1.0
         
         optimizer.zero_grad()
         
-        preds = model(imgs).squeeze(-1)
+        batch = torch.cat([win_img, lose_img], dim=0)
+        scores = model(batch)
+        s_win, s_lose = torch.split(scores, win_img.size(0), dim=0)
         
-        loss = criterion(preds, scores)
+        s_win = s_win.view(-1)
+        s_lose = s_lose.view(-1)
+        
+        pred_diff = s_win - s_lose
+        
+        loss = criterion(pred_diff, target_diff)
         
         loss.backward()
         optimizer.step()
@@ -73,7 +80,7 @@ def validate(model, df_val, cfg, device):
                 gt_scores.append(r['score'])
             
             batch = torch.stack(batch_tensors).to(device)
-            pred_scores = model(batch).squeeze().cpu().numpy() * 10.0
+            pred_scores = model(batch).squeeze().cpu().numpy()
             
             pred_winner_idx = np.argmax(pred_scores)
             max_gt_score = max(gt_scores)
@@ -112,7 +119,7 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=cfg.train.batch_size, sampler=train_sampler, num_workers=cfg.system.num_workers, pin_memory=cfg.system.pin_memory)
     
     model = MobileCLIPRanker(cfg).to(device)
-    model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
     
     param_groups = [
         {'params': model.module.backbone.parameters(), 'lr': cfg.train.lr_backbone},
@@ -122,7 +129,7 @@ def main():
     optimizer = optim.AdamW(param_groups, weight_decay=cfg.train.weight_decay)
 
     if local_rank == 0:
-        print(f"--- Training Pure Regression (No Color Jitter) ---")
+        print(f"--- Training Pairwise Difference Regression ---")
 
     for epoch in range(cfg.train.epochs):
         train_sampler.set_epoch(epoch)
@@ -132,7 +139,7 @@ def main():
             strict, relaxed = validate(model, val_df, cfg, device)
             print(f"Epoch {epoch+1} | Loss: {loss:.4f} | Strict: {strict:.4f} | Relaxed: {relaxed:.4f}")
             
-            if relaxed > 0.70:
+            if relaxed > 0.65:
                 torch.save(model.module.state_dict(), f"checkpoint_epoch_{epoch+1}.pth")
 
     cleanup_ddp()
