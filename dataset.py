@@ -3,14 +3,13 @@ from torch.utils.data import Dataset
 import pandas as pd
 from PIL import Image
 from torchvision import transforms
-import random
 import os
+import numpy as np
 
 class PropertyPreferenceDataset(Dataset):
-    def __init__(self, df, images_dir="images", is_train=False, img_size=336):
+    def __init__(self, df, images_dir="images", is_train=False, img_size=336, max_len=15):
         self.img_size = img_size
-        self.is_train = is_train
-        self.pairs = []
+        self.max_len = max_len
         self.images_dir = images_dir
         
         self.df = df.copy()
@@ -25,32 +24,13 @@ class PropertyPreferenceDataset(Dataset):
             std=(0.229, 0.224, 0.225)
         )
 
-        # 2. ANCHOR-BEST STRATEGY
+        self.groups = []
         if not self.df.empty:
             grouped = self.df.groupby('group_id')
-            
-            for group_id, group in grouped:
+            for g_id, group in grouped:
                 if len(group) < 2: continue
-                
                 records = group.to_dict('records')
-                
-                max_score = max(r['score'] for r in records)
-                
-                anchors = [r for r in records if r['score'] >= (max_score - 0.5)]
-                
-
-                others = [r for r in records if r['score'] <= (max_score - 2.0)]
-                
-                if not anchors or not others:
-                    continue
-                
-                for win in anchors:
-                    for lose in others:
-                        self.pairs.append({
-                            'win_path': win['file_path'],
-                            'lose_path': lose['file_path'],
-                            'score_diff': win['score'] - lose['score']
-                        })
+                self.groups.append(records)
 
     def _letterbox_image(self, img_path):
         try:
@@ -69,18 +49,33 @@ class PropertyPreferenceDataset(Dataset):
             return Image.new('RGB', (self.img_size, self.img_size), (0, 0, 0))
 
     def __len__(self):
-        return len(self.pairs)
+        return len(self.groups)
 
     def __getitem__(self, idx):
-        item = self.pairs[idx]
-        img_win = self._letterbox_image(item['win_path'])
-        img_lose = self._letterbox_image(item['lose_path'])
-
-        if self.is_train:
-            if random.random() > 0.5: img_win = transforms.functional.hflip(img_win)
-            if random.random() > 0.5: img_lose = transforms.functional.hflip(img_lose)
-
-        t_win = self.normalize(transforms.functional.to_tensor(img_win))
-        t_lose = self.normalize(transforms.functional.to_tensor(img_lose))
-
-        return t_win, t_lose, torch.tensor(1.0, dtype=torch.float32)
+        records = self.groups[idx]
+        current_len = min(len(records), self.max_len)
+        selected_records = records[:current_len]
+        
+        image_tensors = []
+        scores = []
+        
+        for r in selected_records:
+            img = self._letterbox_image(r['file_path'])
+            t_img = transforms.functional.to_tensor(img)
+            t_img = self.normalize(t_img)
+            image_tensors.append(t_img)
+            scores.append(float(r['score']))
+            
+        pad_len = self.max_len - current_len
+        if pad_len > 0:
+            for _ in range(pad_len):
+                image_tensors.append(torch.zeros(3, self.img_size, self.img_size))
+                scores.append(-1e9) 
+        
+        # stack into [MaxLen, 3, H, W]
+        img_stack = torch.stack(image_tensors)
+        score_stack = torch.tensor(scores, dtype=torch.float32)
+        
+        mask = torch.cat([torch.ones(current_len), torch.zeros(pad_len)])
+        
+        return img_stack, score_stack, mask

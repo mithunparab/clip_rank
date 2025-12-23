@@ -6,20 +6,20 @@ data:
   csv_path: "dataset.csv"
   images_dir: "images"
   img_size: 336
+  max_images_per_group: 15
   val_fold: 0
 
 model:
   name: "mobileclip_b"
   head_hidden_dim: 512
-  dropout: 0.3
+  dropout: 0.1
 
 train:
-  batch_size: 8
-  lr_backbone: 5.0e-6   
-  lr_head: 1.0e-4
-  epochs: 20
-  weight_decay: 0.05
+  batch_size: 1        
+  lr_head: 3.0e-4      
+  epochs: 50           
+  weight_decay: 0.01
   grad_clip: 1.0
-  margin: 0.5           
+  gt_temperature: 1.0  
   seed: 42
   save_dir: "./checkpoints"
