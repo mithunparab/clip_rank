@@ -12,7 +12,6 @@ import numpy as np
 from sklearn.model_selection import GroupKFold
 from tqdm import tqdm
 from torchvision import transforms 
-
 from dataset import PropertyPreferenceDataset
 from model import MobileCLIPRanker
 from utils import load_config 
@@ -40,15 +39,11 @@ def listnet_loss(pred_scores, gt_scores, mask, temperature=1.0):
     pred_log_probs = F.log_softmax(pred_scores, dim=1)
     
     loss = -torch.sum(gt_probs * pred_log_probs, dim=1)
-    
     return loss.mean()
 
 def validate(model, df_val, cfg, device):
     model.eval()
-    ds_helper = PropertyPreferenceDataset(
-        pd.DataFrame({'group_id':[], 'score':[]}), 
-        images_dir="images", is_train=False, img_size=cfg.data.img_size
-    )
+    ds_helper = PropertyPreferenceDataset(pd.DataFrame({'group_id':[], 'score':[]}), images_dir="images", is_train=False, img_size=cfg.data.img_size)
     
     if 'file_path' not in df_val.columns:
          df_val = df_val.copy()
@@ -75,8 +70,9 @@ def validate(model, df_val, cfg, device):
             if len(images) < 2: continue
             
             batch = torch.stack(images).unsqueeze(0).to(device)
+            mask = torch.ones(1, len(images)).to(device)
             
-            pred_scores = model(batch).view(-1).cpu().numpy()
+            pred_scores = model(batch, mask=mask).view(-1).cpu().numpy()
             
             best_pred_idx = np.argmax(pred_scores)
             score_of_model_choice = gt_scores[best_pred_idx]
@@ -101,24 +97,13 @@ def main():
     train_df = df.iloc[train_idx]
     val_df = df.iloc[val_idx]
     
-    train_ds = PropertyPreferenceDataset(
-        train_df, 
-        images_dir="images", 
-        is_train=True, 
-        img_size=cfg.data.img_size,
-        max_len=cfg.data.max_images_per_group
-    )
-    
+    train_ds = PropertyPreferenceDataset(train_df, images_dir="images", is_train=True, img_size=cfg.data.img_size, max_len=cfg.data.max_images_per_group)
     sampler = DistributedSampler(train_ds, shuffle=True) if dist.is_initialized() else None
     
     train_loader = DataLoader(
-        train_ds, 
-        batch_size=cfg.train.batch_size, 
-        sampler=sampler, 
-        num_workers=cfg.system.num_workers, 
-        pin_memory=cfg.system.pin_memory, 
-        shuffle=(sampler is None), 
-        drop_last=True
+        train_ds, batch_size=cfg.train.batch_size, sampler=sampler, 
+        num_workers=cfg.system.num_workers, pin_memory=cfg.system.pin_memory, 
+        shuffle=(sampler is None), drop_last=True
     )
     
     device = torch.device(f"cuda:{local_rank}")
@@ -127,16 +112,12 @@ def main():
     if dist.is_initialized():
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
     
-    backbone_params = [p for n, p in model.module.backbone.named_parameters() if p.requires_grad]
-    head_params = list(model.module.head.parameters())
-    
-    optimizer = optim.AdamW([
-        {'params': backbone_params, 'lr': cfg.train.lr_backbone},
-        {'params': head_params, 'lr': cfg.train.lr_head}
-    ], weight_decay=cfg.train.weight_decay)
+    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), 
+                           lr=cfg.train.lr_head, 
+                           weight_decay=cfg.train.weight_decay)
     
     if rank == 0:
-        print(f"Training on {len(train_ds)} properties using ListNet Loss.")
+        print(f"Training Context-Aware Ranker on {len(train_ds)} properties.")
 
     for epoch in range(cfg.train.epochs):
         if dist.is_initialized(): sampler.set_epoch(epoch)
@@ -146,15 +127,13 @@ def main():
         iterator = tqdm(train_loader, desc=f"Epoch {epoch+1}") if rank == 0 else train_loader
         
         for img_stack, score_stack, mask in iterator:
-            img_stack = img_stack.to(device)
-            score_stack = score_stack.to(device)
-            mask = mask.to(device)
+            img_stack, score_stack, mask = img_stack.to(device), score_stack.to(device), mask.to(device)
             
             optimizer.zero_grad()
             
-            pred_scores = model(img_stack)
+            pred_scores = model(img_stack, mask=mask)
             
-            loss = listnet_loss(pred_scores, score_stack, mask, temperature=cfg.train.gt_temperature)
+            loss = listnet_loss(pred_scores, score_stack, mask, temperature=1.0)
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)

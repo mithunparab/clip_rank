@@ -7,42 +7,37 @@ class MobileCLIPRanker(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         
-        ckpt_path = self._download_weights(cfg.model.name)
-        print(f"Loading Backbone from {ckpt_path}...")
-        model, _, _ = mobileclip.create_model_and_transforms(
-            cfg.model.name, 
-            pretrained=ckpt_path
-        )
+        ckpt = self._download_weights(cfg.model.name)
+        print(f"Loading Backbone from {ckpt}...")
+        model, _, _ = mobileclip.create_model_and_transforms(cfg.model.name, pretrained=ckpt)
         self.backbone = model.image_encoder
         self.backbone_dim = 512 
         
+        self.backbone.eval()
         for param in self.backbone.parameters():
             param.requires_grad = False
             
-        params = list(self.backbone.named_parameters())
-        num_to_unfreeze = int(len(params) * 0.2)
-        print(f"Unfreezing top {num_to_unfreeze} layers for fine-tuning...")
+        self.project = nn.Linear(self.backbone_dim, 256)
         
-        for name, param in params[-num_to_unfreeze:]:
-            param.requires_grad = True
-
-        self.head = nn.Sequential(
-            nn.Dropout(p=cfg.model.dropout),
-            nn.Linear(self.backbone_dim, cfg.model.head_hidden_dim),
-            nn.LayerNorm(cfg.model.head_hidden_dim),
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=256, 
+            nhead=4, 
+            dim_feedforward=512, 
+            dropout=0.1, 
+            batch_first=True
+        )
+        self.context_encoder = nn.TransformerEncoder(encoder_layer, num_layers=2)
+        
+        self.scorer = nn.Sequential(
+            nn.Linear(256, 128),
             nn.GELU(),
-            nn.Linear(cfg.model.head_hidden_dim, 1)
+            nn.Linear(128, 1)
         )
         
         self.apply(self._init_weights)
 
     def _download_weights(self, model_name):
-        repo_id = "apple/MobileCLIP-B"
-        filename = "mobileclip_b.pt"
-        try:
-            return hf_hub_download(repo_id=repo_id, filename=filename)
-        except Exception as e:
-            raise RuntimeError(f"Weights download failed: {e}")
+        return hf_hub_download(repo_id="apple/MobileCLIP-B", filename="mobileclip_b.pt")
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -54,13 +49,22 @@ class MobileCLIPRanker(nn.Module):
         self.backbone.eval() 
         return self
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
         b, g, c, h, w = x.shape
         
         x_flat = x.view(b * g, c, h, w)
+        with torch.no_grad():
+            features = self.backbone(x_flat)
+            
+        features = features.view(b, g, -1)
+        x_ctx = self.project(features)
         
-        features = self.backbone(x_flat)
+        if mask is not None:
+            padding_mask = (mask == 0)
+        else:
+            padding_mask = None
+            
+        x_ctx = self.context_encoder(x_ctx, src_key_padding_mask=padding_mask)
+        scores = self.scorer(x_ctx)
         
-        scores = self.head(features)
-        
-        return scores.view(b, g)
+        return scores.squeeze(-1)
