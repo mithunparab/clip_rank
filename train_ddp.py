@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 from dataset import PropertyPreferenceDataset
 from model import MobileCLIPRanker
-from utils import load_config
+from utils import load_config 
 
 def setup_ddp():
     if "RANK" in os.environ:
@@ -29,9 +29,17 @@ def cleanup_ddp():
         dist.destroy_process_group()
 
 def validate(model, df_val, cfg, device):
+    """
+    Validates by ranking images within groups.
+    Calculates Strict Accuracy and Relaxed Accuracy.
+    """
     model.eval()
     
-    ds_helper = PropertyPreferenceDataset(pd.DataFrame(), is_train=False, img_size=cfg.data.img_size)
+    ds_helper = PropertyPreferenceDataset(df_val, images_dir="images", is_train=False, img_size=cfg.data.img_size)
+    
+    if 'file_path' not in df_val.columns:
+         df_val = df_val.copy()
+         df_val['file_path'] = df_val.index.map(lambda x: f"images/{x}.jpg")
     
     grouped = df_val.groupby('group_id')
     strict_wins = 0
@@ -44,33 +52,29 @@ def validate(model, df_val, cfg, device):
             
             images = []
             gt_scores = []
-            paths = []
             
             for _, row in group.iterrows():
                 path = row['file_path']
                 if not os.path.exists(path): continue
                 
                 img = ds_helper._letterbox_image(path)
-                t_img = transforms.functional.to_tensor(img)
-                t_img = ds_helper.normalize(t_img)
+                t_img = ds_helper.normalize(transforms.functional.to_tensor(img))
                 
                 images.append(t_img)
                 gt_scores.append(row['score'])
-                paths.append(path)
                 
             if len(images) < 2: continue
             
             batch = torch.stack(images).to(device)
-            pred_scores = model(batch).squeeze().cpu().numpy()
+            pred_scores = model(batch).view(-1).cpu().numpy()
             
             best_pred_idx = np.argmax(pred_scores)
             score_of_model_choice = gt_scores[best_pred_idx]
-            
             max_gt_score = max(gt_scores)
             
             if score_of_model_choice == max_gt_score:
                 strict_wins += 1
-                
+            
             if score_of_model_choice >= (max_gt_score - 1.0):
                 relaxed_wins += 1
                 
@@ -88,21 +92,29 @@ def main():
     
     df = pd.read_csv(cfg.data.csv_path)
     
+    
     gkf = GroupKFold(n_splits=5)
     train_idx, val_idx = next(gkf.split(df, groups=df['group_id']))
     train_df = df.iloc[train_idx]
     val_df = df.iloc[val_idx]
     
-    train_ds = PropertyPreferenceDataset(train_df, is_train=True, img_size=cfg.data.img_size)
+    train_ds = PropertyPreferenceDataset(
+        train_df, 
+        images_dir="images", 
+        is_train=True, 
+        img_size=cfg.data.img_size
+    )
     
     sampler = DistributedSampler(train_ds, shuffle=True) if dist.is_initialized() else None
+    
     train_loader = DataLoader(
         train_ds, 
         batch_size=cfg.train.batch_size, 
         sampler=sampler, 
         num_workers=cfg.system.num_workers, 
         pin_memory=cfg.system.pin_memory,
-        shuffle=(sampler is None)
+        shuffle=(sampler is None),
+        drop_last=True 
     )
     
     device = torch.device(f"cuda:{local_rank}")
@@ -120,7 +132,7 @@ def main():
     optimizer = optim.AdamW(param_groups, weight_decay=cfg.train.weight_decay)
     
     if rank == 0:
-        print(f"Starting training on {len(train_ds)} pairs...")
+        print(f"Training on {len(train_ds)} pairs | Validation on {len(val_df)} images")
 
     for epoch in range(cfg.train.epochs):
         if dist.is_initialized():
@@ -139,18 +151,15 @@ def main():
             
             combined = torch.cat([win_imgs, lose_imgs], dim=0)
             all_scores = model(combined)
-            
             s_win, s_lose = torch.split(all_scores, win_imgs.size(0))
             
             diff = s_win - s_lose
-            
             loss = criterion(diff, targets)
             
             loss.backward()
-            
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
-            
             optimizer.step()
+            
             total_loss += loss.item()
             
         if rank == 0:
