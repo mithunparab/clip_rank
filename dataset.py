@@ -7,7 +7,7 @@ import os
 import numpy as np
 
 class PropertyPreferenceDataset(Dataset):
-    def __init__(self, df, images_dir="images", is_train=False, img_size=336, max_len=12):
+    def __init__(self, df, images_dir="images", is_train=False, img_size=336, max_len=15):
         self.img_size = img_size
         self.max_len = max_len
         self.images_dir = images_dir
@@ -32,6 +32,7 @@ class PropertyPreferenceDataset(Dataset):
                 self.groups.append(group.to_dict('records'))
 
     def _letterbox_image(self, img_path):
+        """Resize preserving aspect ratio (Bicubic)."""
         try:
             with Image.open(img_path) as img:
                 img = img.convert('RGB')
