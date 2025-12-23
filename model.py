@@ -17,21 +17,12 @@ class MobileCLIPRanker(nn.Module):
         for param in self.backbone.parameters():
             param.requires_grad = False
             
-        self.project = nn.Linear(self.backbone_dim, 256)
-        
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=256, 
-            nhead=4, 
-            dim_feedforward=512, 
-            dropout=0.1, 
-            batch_first=True
-        )
-        self.context_encoder = nn.TransformerEncoder(encoder_layer, num_layers=2)
-        
-        self.scorer = nn.Sequential(
-            nn.Linear(256, 128),
+        self.head = nn.Sequential(
+            nn.Dropout(p=cfg.model.dropout),
+            nn.Linear(self.backbone_dim, cfg.model.head_hidden_dim),
             nn.GELU(),
-            nn.Linear(128, 1)
+            nn.Dropout(p=cfg.model.dropout),
+            nn.Linear(cfg.model.head_hidden_dim, 1)
         )
         
         self.apply(self._init_weights)
@@ -49,22 +40,13 @@ class MobileCLIPRanker(nn.Module):
         self.backbone.eval() 
         return self
 
-    def forward(self, x, mask=None):
+    def forward(self, x):
+        # x: [Batch, GroupSize, 3, H, W]
         b, g, c, h, w = x.shape
-        
         x_flat = x.view(b * g, c, h, w)
+        
         with torch.no_grad():
             features = self.backbone(x_flat)
             
-        features = features.view(b, g, -1)
-        x_ctx = self.project(features)
-        
-        if mask is not None:
-            padding_mask = (mask == 0)
-        else:
-            padding_mask = None
-            
-        x_ctx = self.context_encoder(x_ctx, src_key_padding_mask=padding_mask)
-        scores = self.scorer(x_ctx)
-        
-        return scores.squeeze(-1)
+        scores = self.head(features)
+        return scores.view(b, g)
