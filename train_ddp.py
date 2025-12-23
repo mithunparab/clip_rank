@@ -28,10 +28,6 @@ def cleanup_ddp():
     if dist.is_initialized(): dist.destroy_process_group()
 
 def dynamic_margin_loss(pred_scores, gt_scores, valid_len):
-    """
-    Computes Pairwise Hinge Loss for valid pairs.
-    Margin is scaled by GT difference: (Score_A - Score_B) * 0.1
-    """
     device = pred_scores.device
     loss = torch.tensor(0.0, device=device)
     n_pairs = 0
@@ -45,21 +41,16 @@ def dynamic_margin_loss(pred_scores, gt_scores, valid_len):
         g_diff_mat = g_scores.unsqueeze(0) - g_scores.unsqueeze(1)
         
         pair_mask = g_diff_mat > 0
-        
-        if pair_mask.sum() == 0:
-            continue
+        if pair_mask.sum() == 0: continue
             
         dynamic_margins = g_diff_mat[pair_mask] * 0.1
-        
         preds = p_diff_mat[pair_mask]
-        pair_losses = torch.relu(dynamic_margins - preds)
         
+        pair_losses = torch.relu(dynamic_margins - preds)
         loss += pair_losses.mean()
         n_pairs += 1
         
-    if n_pairs > 0:
-        return loss / n_pairs
-    return loss
+    return loss / n_pairs if n_pairs > 0 else loss
 
 def validate(model, df_val, cfg, device):
     model.eval()
@@ -92,9 +83,12 @@ def validate(model, df_val, cfg, device):
                 
             if len(images) < 2: continue
             
-            # Batch: [1, N, 3, H, W]
+            # Create Batch [1, N, 3, H, W]
             batch = torch.stack(images).unsqueeze(0).to(device)
-            pred_scores = model(batch).view(-1).cpu().numpy()
+            valid_len = torch.tensor([len(images)]).to(device)
+            
+            # Predict with context
+            pred_scores = model(batch, valid_lens=valid_len).view(-1).cpu().numpy()
             
             best_pred_idx = np.argmax(pred_scores)
             score_of_model_choice = gt_scores[best_pred_idx]
@@ -114,7 +108,6 @@ def main():
     np.random.seed(cfg.train.seed)
     
     df = pd.read_csv(cfg.data.csv_path)
-    
     gkf = GroupKFold(n_splits=cfg.data.n_splits)
     train_idx, val_idx = next(gkf.split(df, groups=df['group_id']))
     train_df = df.iloc[train_idx]
@@ -138,7 +131,7 @@ def main():
     optimizer = optim.AdamW(model.module.head.parameters(), lr=cfg.train.lr_head, weight_decay=cfg.train.weight_decay)
     
     if rank == 0:
-        print(f"Training on {len(train_ds)} properties.")
+        print(f"Training Group-Centered Ranker on {len(train_ds)} properties.")
 
     for epoch in range(cfg.train.epochs):
         if dist.is_initialized(): sampler.set_epoch(epoch)
@@ -148,10 +141,10 @@ def main():
         iterator = tqdm(train_loader, desc=f"Epoch {epoch+1}") if rank == 0 else train_loader
         
         for img_stack, score_stack, valid_len in iterator:
-            img_stack, score_stack = img_stack.to(device), score_stack.to(device)
+            img_stack, score_stack, valid_len = img_stack.to(device), score_stack.to(device), valid_len.to(device)
             
             optimizer.zero_grad()
-            pred_scores = model(img_stack)
+            pred_scores = model(img_stack, valid_lens=valid_len)
             
             loss = dynamic_margin_loss(pred_scores, score_stack, valid_len)
             

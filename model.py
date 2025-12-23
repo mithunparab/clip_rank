@@ -18,12 +18,13 @@ class MobileCLIPRanker(nn.Module):
             param.requires_grad = False
             
         self.head = nn.Sequential(
-            nn.Dropout(p=cfg.model.dropout),
-            nn.Linear(self.backbone_dim, cfg.model.head_hidden_dim),
+            nn.Linear(self.backbone_dim * 2, cfg.model.head_hidden_dim),
             nn.LayerNorm(cfg.model.head_hidden_dim),
             nn.GELU(),
             nn.Dropout(p=cfg.model.dropout),
-            nn.Linear(cfg.model.head_hidden_dim, 1)
+            nn.Linear(cfg.model.head_hidden_dim, 256),
+            nn.GELU(),
+            nn.Linear(256, 1)
         )
         
         self.apply(self._init_weights)
@@ -41,13 +42,27 @@ class MobileCLIPRanker(nn.Module):
         self.backbone.eval() 
         return self
 
-    def forward(self, x):
-        # x: [Batch, GroupSize, 3, H, W]
+    def forward(self, x, valid_lens=None):
         b, g, c, h, w = x.shape
         x_flat = x.view(b * g, c, h, w)
         
         with torch.no_grad():
             features = self.backbone(x_flat)
             
-        scores = self.head(features)
-        return scores.view(b, g)
+        features = features.view(b, g, -1)
+        
+        if valid_lens is not None:
+            mask = torch.arange(g, device=x.device).expand(b, g) < valid_lens.unsqueeze(1)
+            mask = mask.unsqueeze(-1).float()
+            
+            sum_features = (features * mask).sum(dim=1, keepdim=True)
+            mean_features = sum_features / valid_lens.view(b, 1, 1)
+        else:
+            mean_features = features.mean(dim=1, keepdim=True)
+            
+        diff_features = features - mean_features
+        
+        combined = torch.cat([features, diff_features], dim=2)
+        
+        scores = self.head(combined)
+        return scores.squeeze(-1)
