@@ -7,18 +7,31 @@ import random
 import os
 
 class PropertyPreferenceDataset(Dataset):
-    def __init__(self, df, is_train=False, img_size=336):
+    def __init__(self, df, images_dir="images", is_train=False, img_size=336):
+        """
+        df: DataFrame containing ['group_id', 'score'] (and optional 'file_path')
+        images_dir: Directory where images are saved (e.g. 'images/{index}.jpg')
+        """
         self.img_size = img_size
         self.is_train = is_train
         self.pairs = []
+        self.images_dir = images_dir
         
+        self.df = df.copy()
+        if 'file_path' not in self.df.columns:
+            self.df['file_path'] = self.df.index.map(lambda x: os.path.join(self.images_dir, f"{x}.jpg"))
+
+        valid_mask = self.df['file_path'].apply(os.path.exists)
+        self.df = self.df[valid_mask]
+
         self.normalize = transforms.Normalize(
             mean=(0.485, 0.456, 0.406), 
             std=(0.229, 0.224, 0.225)
         )
 
-        if not df.empty:
-            grouped = df.groupby('group_id')
+
+        if not self.df.empty:
+            grouped = self.df.groupby('group_id')
             
             for _, group in grouped:
                 if len(group) < 2: continue
@@ -41,25 +54,28 @@ class PropertyPreferenceDataset(Dataset):
                             })
 
     def _letterbox_image(self, img_path):
+        """
+        Resize longest side to 336, pad rest with black. Preserves FOV.
+        """
         try:
-            img = Image.open(img_path).convert('RGB')
+            with Image.open(img_path) as img:
+                img = img.convert('RGB')
+                
+                w, h = img.size
+                scale = self.img_size / max(w, h)
+                new_w = int(w * scale)
+                new_h = int(h * scale)
+
+                img_resized = img.resize((new_w, new_h), Image.Resampling.BICUBIC)
+
+                canvas = Image.new('RGB', (self.img_size, self.img_size), (0, 0, 0))
+                x_offset = (self.img_size - new_w) // 2
+                y_offset = (self.img_size - new_h) // 2
+                canvas.paste(img_resized, (x_offset, y_offset))
+                return canvas
         except Exception as e:
-            return torch.zeros(3, self.img_size, self.img_size)
-
-        w, h = img.size
-        scale = self.img_size / max(w, h)
-        new_w = int(w * scale)
-        new_h = int(h * scale)
-
-        img = img.resize((new_w, new_h), Image.Resampling.BICUBIC)
-
-        canvas = Image.new('RGB', (self.img_size, self.img_size), (0, 0, 0))
-        
-        x_offset = (self.img_size - new_w) // 2
-        y_offset = (self.img_size - new_h) // 2
-        canvas.paste(img, (x_offset, y_offset))
-
-        return canvas
+            print(f"Warning: Corrupt image {img_path}")
+            return Image.new('RGB', (self.img_size, self.img_size), (0, 0, 0))
 
     def __len__(self):
         return len(self.pairs)
@@ -76,10 +92,7 @@ class PropertyPreferenceDataset(Dataset):
             if random.random() > 0.5:
                 img_lose = transforms.functional.hflip(img_lose)
 
-        t_win = transforms.functional.to_tensor(img_win)
-        t_lose = transforms.functional.to_tensor(img_lose)
-        
-        t_win = self.normalize(t_win)
-        t_lose = self.normalize(t_lose)
+        t_win = self.normalize(transforms.functional.to_tensor(img_win))
+        t_lose = self.normalize(transforms.functional.to_tensor(img_lose))
 
         return t_win, t_lose, torch.tensor(1.0, dtype=torch.float32)
