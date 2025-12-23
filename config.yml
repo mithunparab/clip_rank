@@ -1,22 +1,22 @@
 system:
-  device: "cuda"
   num_workers: 4
   pin_memory: true
 
 data:
-  csv_path: "dataset.csv"
-  images_dir: "images"
+  csv_path: "dataset.csv"  
   img_size: 336
-  val_fold: 0
+  val_fold: 0            
 
 model:
   name: "mobileclip_b"
   head_hidden_dim: 512
+  dropout: 0.2
 
 train:
-  batch_size: 16
-  lr_backbone: 1.0e-5   
-  lr_head: 2.0e-4
-  epochs: 20
-  weight_decay: 0.05
-  seed: 42
+  batch_size: 16          
+  lr_backbone: 1.0e-6     
+  lr_head: 1.0e-4         
+  epochs: 30
+  weight_decay: 0.01
+  grad_clip: 1.0
+  save_dir: "./checkpoints"
