@@ -32,7 +32,6 @@ class PropertyPreferenceDataset(Dataset):
                 self.groups.append(group.to_dict('records'))
 
     def _letterbox_image(self, img_path):
-        """Resize preserving aspect ratio (Bicubic)."""
         try:
             with Image.open(img_path) as img:
                 img = img.convert('RGB')
