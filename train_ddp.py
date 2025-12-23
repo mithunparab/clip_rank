@@ -1,146 +1,180 @@
 import os
+import yaml
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
-from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
 import pandas as pd
 import numpy as np
+from tqdm import tqdm
 from sklearn.model_selection import GroupKFold
+
 from dataset import PropertyPreferenceDataset
 from model import MobileCLIPRanker
-from utils import load_config
 
 def setup_ddp():
-    dist.init_process_group(backend="nccl")
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    if "RANK" in os.environ:
+        dist.init_process_group("nccl")
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        return rank, local_rank
+    else:
+        return 0, 0
 
 def cleanup_ddp():
-    dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
-def train_epoch(model, loader, optimizer, device):
-    model.train() 
-    total_loss = torch.zeros(1).to(device)
-    
-    criterion = nn.MSELoss()
-    
-    for win_img, lose_img, target_diff in loader:
-        win_img, lose_img = win_img.to(device), lose_img.to(device)
-        target_diff = target_diff.to(device) # 0.0 to 1.0
-        
-        optimizer.zero_grad()
-        
-        batch = torch.cat([win_img, lose_img], dim=0)
-        scores = model(batch)
-        s_win, s_lose = torch.split(scores, win_img.size(0), dim=0)
-        
-        s_win = s_win.view(-1)
-        s_lose = s_lose.view(-1)
-        
-        pred_diff = s_win - s_lose
-        
-        loss = criterion(pred_diff, target_diff)
-        
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.detach()
-        
-    dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
-    return total_loss.item() / (len(loader) * dist.get_world_size())
+def load_config(path='config.yml'):
+    with open(path, 'r') as f:
+        return yaml.safe_load(f)
 
-def validate(model, df_val, cfg, device):
+def validate(model, df_val, device, img_size):
+    """
+    Computes Strict and Relaxed Accuracy.
+    Strategy: Inference on all images in a group, then sort.
+    """
     model.eval()
-    correct_strict = 0
-    correct_relaxed = 0
-    total = 0
     
-    ds_helper = PropertyPreferenceDataset(pd.DataFrame(), 
-                                          model_name=cfg.model.name, 
-                                          img_size=cfg.data.img_size,
-                                          is_train=False)
+    grouped = df_val.groupby('group_id')
     
-    df_val = df_val.copy()
-    df_val['file_path'] = df_val.index.map(lambda x: f"{cfg.data.images_dir}/{x}.jpg")
-    grouped = df_val.groupby(['group_id', 'label'])
+    strict_wins = 0
+    relaxed_wins = 0
+    total_groups = 0
+    
+    ds_helper = PropertyPreferenceDataset(pd.DataFrame(), is_train=False, img_size=img_size)
     
     with torch.no_grad():
         for _, group in grouped:
             if len(group) < 2: continue
-            recs = [r for r in group.to_dict('records') if os.path.exists(r['file_path'])]
-            if len(recs) < 2: continue
             
-            batch_tensors = []
-            gt_scores = []
+            imgs = []
+            scores_gt = []
             
-            for r in recs:
-                tensor = ds_helper._load_local(r['file_path'])
-                batch_tensors.append(tensor)
-                gt_scores.append(r['score'])
+            for _, row in group.iterrows():
+                t_img = ds_helper._letterbox_image(row['file_path'])
+                t_img = transforms.functional.to_tensor(t_img)
+                t_img = ds_helper.normalize(t_img)
+                imgs.append(t_img)
+                scores_gt.append(row['score'])
             
-            batch = torch.stack(batch_tensors).to(device)
-            pred_scores = model(batch).squeeze().cpu().numpy()
+            batch = torch.stack(imgs).to(device)
             
-            pred_winner_idx = np.argmax(pred_scores)
-            max_gt_score = max(gt_scores)
-            score_of_chosen = gt_scores[pred_winner_idx]
+            pred_scores = model(batch).squeeze(-1).cpu().numpy()
             
-            if score_of_chosen == max_gt_score:
-                correct_strict += 1
-            if score_of_chosen >= (max_gt_score - 1.0):
-                correct_relaxed += 1
+
+            best_pred_idx = np.argmax(pred_scores)
+            best_gt_score = max(scores_gt)
+            
+            score_of_selected = scores_gt[best_pred_idx]
+            
+            if score_of_selected == best_gt_score:
+                strict_wins += 1
+            
+            if score_of_selected >= (best_gt_score - 1.0):
+                relaxed_wins += 1
                 
-            total += 1
-            
-    if total == 0: return 0, 0
-    return (correct_strict / total), (correct_relaxed / total)
+            total_groups += 1
+    
+    if total_groups == 0: return 0.0, 0.0
+    return strict_wins / total_groups, relaxed_wins / total_groups
 
 def main():
-    setup_ddp()
+    rank, local_rank = setup_ddp()
     cfg = load_config()
-    local_rank = int(os.environ["LOCAL_RANK"])
-    device = torch.device(f"cuda:{local_rank}")
     
-    torch.manual_seed(cfg.train.seed)
-    np.random.seed(cfg.train.seed)
-
-    df = pd.read_csv(cfg.data.csv_path)
+    df = pd.read_csv(cfg['data']['csv_path'])
+    
     gkf = GroupKFold(n_splits=5)
     groups = df['group_id'].values
-    folds = list(gkf.split(df, groups=groups))
-    train_idx, val_idx = folds[cfg.data.val_fold]
+    train_idx, val_idx = next(gkf.split(df, df['score'], groups))
     
-    train_df = df.iloc[train_idx]
-    val_df = df.iloc[val_idx]
+    df_train = df.iloc[train_idx]
+    df_val = df.iloc[val_idx]
     
-    train_ds = PropertyPreferenceDataset(train_df, model_name=cfg.model.name, img_size=cfg.data.img_size, is_train=True)
-    train_sampler = DistributedSampler(train_ds, shuffle=True)
-    train_loader = DataLoader(train_ds, batch_size=cfg.train.batch_size, sampler=train_sampler, num_workers=cfg.system.num_workers, pin_memory=cfg.system.pin_memory)
+    train_ds = PropertyPreferenceDataset(df_train, is_train=True, img_size=cfg['data']['img_size'])
+    train_sampler = DistributedSampler(train_ds, shuffle=True) if dist.is_initialized() else None
     
-    model = MobileCLIPRanker(cfg).to(device)
-    model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+    train_loader = DataLoader(
+        train_ds, 
+        batch_size=cfg['train']['batch_size'],
+        sampler=train_sampler,
+        num_workers=cfg['system']['num_workers'],
+        pin_memory=cfg['system']['pin_memory'],
+        shuffle=(train_sampler is None)
+    )
+    
+    model = MobileCLIPRanker(
+        head_hidden_dim=cfg['model']['head_hidden_dim'],
+        dropout=cfg['model']['dropout']
+    ).to(local_rank)
+    
+    if dist.is_initialized():
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
     
     param_groups = [
-        {'params': model.module.backbone.parameters(), 'lr': cfg.train.lr_backbone},
-        {'params': model.module.score_head.parameters(), 'lr': cfg.train.lr_head}
+        {'params': model.module.backbone.parameters(), 'lr': cfg['train']['lr_backbone']},
+        {'params': model.module.head.parameters(), 'lr': cfg['train']['lr_head']}
     ]
+    optimizer = optim.AdamW(param_groups, weight_decay=cfg['train']['weight_decay'])
     
-    optimizer = optim.AdamW(param_groups, weight_decay=cfg.train.weight_decay)
 
-    if local_rank == 0:
-        print(f"--- Training Pairwise Difference Regression ---")
+    criterion = nn.BCEWithLogitsLoss()
+    target_ones = torch.ones(cfg['train']['batch_size'], 1).to(local_rank)
 
-    for epoch in range(cfg.train.epochs):
-        train_sampler.set_epoch(epoch)
-        loss = train_epoch(model, train_loader, optimizer, device)
+    os.makedirs(cfg['train']['save_dir'], exist_ok=True)
+    
+    for epoch in range(cfg['train']['epochs']):
+        if dist.is_initialized():
+            train_sampler.set_epoch(epoch)
         
-        if local_rank == 0:
-            strict, relaxed = validate(model, val_df, cfg, device)
-            print(f"Epoch {epoch+1} | Loss: {loss:.4f} | Strict: {strict:.4f} | Relaxed: {relaxed:.4f}")
+        model.train()
+        epoch_loss = 0.0
+        
+        iterator = train_loader
+        if rank == 0:
+            iterator = tqdm(train_loader, desc=f"Epoch {epoch+1}")
             
-            if relaxed > 0.65:
-                torch.save(model.module.state_dict(), f"checkpoint_epoch_{epoch+1}.pth")
+        for win_img, lose_img in iterator:
+            win_img = win_img.to(local_rank)
+            lose_img = lose_img.to(local_rank)
+            
+            optimizer.zero_grad()
+            
+
+            batch = torch.cat([win_img, lose_img], dim=0)
+            scores = model(batch) 
+            
+            s_win, s_lose = torch.split(scores, win_img.size(0))
+            
+
+            diff = s_win - s_lose
+            
+            curr_batch_size = diff.size(0)
+            loss = criterion(diff, torch.ones(curr_batch_size, 1).to(local_rank))
+            
+            loss.backward()
+            
+            if cfg['train']['grad_clip'] > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg['train']['grad_clip'])
+                
+            optimizer.step()
+            epoch_loss += loss.item()
+            
+        if rank == 0:
+            avg_loss = epoch_loss / len(train_loader)
+            strict_acc, relaxed_acc = validate(model.module, df_val, local_rank, cfg['data']['img_size'])
+            
+            print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Strict Acc: {strict_acc:.4f} | Relaxed Acc: {relaxed_acc:.4f}")
+            
+            torch.save(model.module.state_dict(), f"{cfg['train']['save_dir']}/epoch_{epoch+1}.pt")
+            
+            if relaxed_acc > 0.85: 
+                print("High relaxed accuracy reached. Snapshotting best model.")
+                torch.save(model.module.state_dict(), f"{cfg['train']['save_dir']}/best_relaxed.pt")
 
     cleanup_ddp()
 
