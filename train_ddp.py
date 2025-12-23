@@ -29,21 +29,19 @@ def cleanup_ddp():
 
 def dynamic_margin_loss(pred_scores, gt_scores, valid_len):
     """
-    Computes Hinge Loss for EVERY valid pair in the group.
-    Margin is dynamic based on GT difference.
+    Computes Pairwise Hinge Loss for valid pairs.
+    Margin is scaled by GT difference: (Score_A - Score_B) * 0.1
     """
     device = pred_scores.device
     loss = torch.tensor(0.0, device=device)
     n_pairs = 0
     
     for b in range(pred_scores.shape[0]):
-        n_imgs = int(valid_len[b])
+        n_imgs = int(valid_len[b].item())
         p_scores = pred_scores[b, :n_imgs]
         g_scores = gt_scores[b, :n_imgs]
         
         p_diff_mat = p_scores.unsqueeze(0) - p_scores.unsqueeze(1)
-        
-
         g_diff_mat = g_scores.unsqueeze(0) - g_scores.unsqueeze(1)
         
         pair_mask = g_diff_mat > 0
@@ -51,11 +49,9 @@ def dynamic_margin_loss(pred_scores, gt_scores, valid_len):
         if pair_mask.sum() == 0:
             continue
             
-
         dynamic_margins = g_diff_mat[pair_mask] * 0.1
         
         preds = p_diff_mat[pair_mask]
-        
         pair_losses = torch.relu(dynamic_margins - preds)
         
         loss += pair_losses.mean()
@@ -67,7 +63,10 @@ def dynamic_margin_loss(pred_scores, gt_scores, valid_len):
 
 def validate(model, df_val, cfg, device):
     model.eval()
-    ds_helper = PropertyPreferenceDataset(pd.DataFrame({'group_id':[], 'score':[]}), images_dir="images", is_train=False, img_size=cfg.data.img_size)
+    ds_helper = PropertyPreferenceDataset(
+        pd.DataFrame({'group_id':[], 'score':[]}), 
+        images_dir="images", is_train=False, img_size=cfg.data.img_size
+    )
     
     if 'file_path' not in df_val.columns:
          df_val = df_val.copy()
@@ -93,6 +92,7 @@ def validate(model, df_val, cfg, device):
                 
             if len(images) < 2: continue
             
+            # Batch: [1, N, 3, H, W]
             batch = torch.stack(images).unsqueeze(0).to(device)
             pred_scores = model(batch).view(-1).cpu().numpy()
             
@@ -114,6 +114,7 @@ def main():
     np.random.seed(cfg.train.seed)
     
     df = pd.read_csv(cfg.data.csv_path)
+    
     gkf = GroupKFold(n_splits=cfg.data.n_splits)
     train_idx, val_idx = next(gkf.split(df, groups=df['group_id']))
     train_df = df.iloc[train_idx]
@@ -137,7 +138,7 @@ def main():
     optimizer = optim.AdamW(model.module.head.parameters(), lr=cfg.train.lr_head, weight_decay=cfg.train.weight_decay)
     
     if rank == 0:
-        print(f"Training on {len(train_ds)} properties (95% Split).")
+        print(f"Training on {len(train_ds)} properties.")
 
     for epoch in range(cfg.train.epochs):
         if dist.is_initialized(): sampler.set_epoch(epoch)
@@ -166,6 +167,7 @@ def main():
             print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Strict: {strict:.2%} | Relaxed: {relaxed:.2%}")
             
             if relaxed > 0.65:
+                os.makedirs(cfg.train.save_dir, exist_ok=True)
                 torch.save(model.module.state_dict(), f"{cfg.train.save_dir}/epoch_{epoch+1}.pth")
 
     cleanup_ddp()

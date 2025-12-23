@@ -20,6 +20,7 @@ class MobileCLIPRanker(nn.Module):
         self.head = nn.Sequential(
             nn.Dropout(p=cfg.model.dropout),
             nn.Linear(self.backbone_dim, cfg.model.head_hidden_dim),
+            nn.LayerNorm(cfg.model.head_hidden_dim),
             nn.GELU(),
             nn.Dropout(p=cfg.model.dropout),
             nn.Linear(cfg.model.head_hidden_dim, 1)
