@@ -5,7 +5,7 @@ from huggingface_hub import hf_hub_download
 
 class MobileCLIPRanker(nn.Module):
     def __init__(self, cfg):
-        super().__inait__()
+        super().__init__()
         
         ckpt_path = self._download_weights(cfg.model.name)
         print(f"Loading Backbone from {ckpt_path}...")
