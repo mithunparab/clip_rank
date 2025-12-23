@@ -29,10 +29,6 @@ def cleanup_ddp():
         dist.destroy_process_group()
 
 def validate(model, df_val, cfg, device):
-    """
-    Validates by ranking images within groups.
-    Calculates Strict Accuracy and Relaxed Accuracy.
-    """
     model.eval()
     
     ds_helper = PropertyPreferenceDataset(df_val, images_dir="images", is_train=False, img_size=cfg.data.img_size)
@@ -74,7 +70,6 @@ def validate(model, df_val, cfg, device):
             
             if score_of_model_choice == max_gt_score:
                 strict_wins += 1
-            
             if score_of_model_choice >= (max_gt_score - 1.0):
                 relaxed_wins += 1
                 
@@ -91,7 +86,6 @@ def main():
     np.random.seed(cfg.train.seed)
     
     df = pd.read_csv(cfg.data.csv_path)
-    
     
     gkf = GroupKFold(n_splits=5)
     train_idx, val_idx = next(gkf.split(df, groups=df['group_id']))
@@ -114,7 +108,7 @@ def main():
         num_workers=cfg.system.num_workers, 
         pin_memory=cfg.system.pin_memory,
         shuffle=(sampler is None),
-        drop_last=True 
+        drop_last=True
     )
     
     device = torch.device(f"cuda:{local_rank}")
