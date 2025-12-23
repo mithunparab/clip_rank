@@ -1,4 +1,5 @@
 import os
+import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -83,11 +84,9 @@ def validate(model, df_val, cfg, device):
                 
             if len(images) < 2: continue
             
-            # Create Batch [1, N, 3, H, W]
             batch = torch.stack(images).unsqueeze(0).to(device)
             valid_len = torch.tensor([len(images)]).to(device)
             
-            # Predict with context
             pred_scores = model(batch, valid_lens=valid_len).view(-1).cpu().numpy()
             
             best_pred_idx = np.argmax(pred_scores)
@@ -101,9 +100,22 @@ def validate(model, df_val, cfg, device):
     if total_groups == 0: return 0.0, 0.0
     return strict_wins / total_groups, relaxed_wins / total_groups
 
+def save_checkpoint(model, optimizer, epoch, path):
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.module.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+    }
+    torch.save(checkpoint, path)
+
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--resume', type=str, default=None, help='Path to .pth file to resume from')
+    args = parser.parse_args()
+
     rank, local_rank = setup_ddp()
     cfg = load_config("config.yml")
+    
     torch.manual_seed(cfg.train.seed)
     np.random.seed(cfg.train.seed)
     
@@ -130,10 +142,38 @@ def main():
     
     optimizer = optim.AdamW(model.module.head.parameters(), lr=cfg.train.lr_head, weight_decay=cfg.train.weight_decay)
     
-    if rank == 0:
-        print(f"Training Group-Centered Ranker on {len(train_ds)} properties.")
+    start_epoch = 0
 
-    for epoch in range(cfg.train.epochs):
+    if args.resume:
+        if os.path.isfile(args.resume):
+            if rank == 0:
+                print(f"--> Loading checkpoint: {args.resume}")
+            
+            checkpoint = torch.load(args.resume, map_location=device)
+            
+            if 'model_state_dict' in checkpoint:
+                model.module.load_state_dict(checkpoint['model_state_dict'])
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                start_epoch = checkpoint['epoch']
+                if rank == 0: print(f"--> Resuming from Epoch {start_epoch}")
+            else:
+                state_dict = checkpoint
+                new_state_dict = {}
+                for k, v in state_dict.items():
+                    if k.startswith('module.'):
+                        new_state_dict[k] = v
+                    else:
+                        new_state_dict[f'module.{k}'] = v
+                
+                model.load_state_dict(new_state_dict)
+                if rank == 0: print("--> Weights loaded. Restarting optimizer fresh (Fine-tuning continuation).")
+        else:
+            if rank == 0: print(f"--> Error: No checkpoint found at {args.resume}")
+
+    if rank == 0:
+        print(f"Training on {len(train_ds)} properties (95% Split). Val set size: {len(val_df)}")
+
+    for epoch in range(start_epoch, cfg.train.epochs):
         if dist.is_initialized(): sampler.set_epoch(epoch)
         model.train()
         total_loss = 0.0
@@ -159,9 +199,10 @@ def main():
             
             print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Strict: {strict:.2%} | Relaxed: {relaxed:.2%}")
             
-            if relaxed > 0.65:
+            if relaxed > 0.65 or (epoch + 1) % 5 == 0:
                 os.makedirs(cfg.train.save_dir, exist_ok=True)
-                torch.save(model.module.state_dict(), f"{cfg.train.save_dir}/epoch_{epoch+1}.pth")
+                save_path = f"{cfg.train.save_dir}/epoch_{epoch+1}.pth"
+                save_checkpoint(model, optimizer, epoch + 1, save_path)
 
     cleanup_ddp()
 
