@@ -17,7 +17,6 @@ class PropertyPreferenceDataset(Dataset):
         if is_train:
             self.transform = transforms.Compose([
                 transforms.RandomHorizontalFlip(p=0.5),
-                transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.05),
                 transforms.ToTensor(),
                 transforms.Normalize(mean, std)
             ])

@@ -24,15 +24,17 @@ def train_epoch(model, loader, optimizer, device):
     model.train() 
     total_loss = torch.zeros(1).to(device)
     
+    criterion = nn.HuberLoss(delta=0.1) 
+    
     for imgs, scores in loader:
         imgs = imgs.to(device)
         scores = scores.to(device) 
         
         optimizer.zero_grad()
         
-        preds = model(imgs)
+        preds = model(imgs).squeeze(-1)
         
-        loss = nn.MSELoss()(preds, scores)
+        loss = criterion(preds, scores)
         
         loss.backward()
         optimizer.step()
@@ -71,7 +73,7 @@ def validate(model, df_val, cfg, device):
                 gt_scores.append(r['score'])
             
             batch = torch.stack(batch_tensors).to(device)
-            pred_scores = model(batch).squeeze().cpu().numpy()
+            pred_scores = model(batch).squeeze().cpu().numpy() * 10.0
             
             pred_winner_idx = np.argmax(pred_scores)
             max_gt_score = max(gt_scores)
@@ -114,13 +116,13 @@ def main():
     
     param_groups = [
         {'params': model.module.backbone.parameters(), 'lr': cfg.train.lr_backbone},
-        {'params': [model.module.anchors, model.module.scale, model.module.bias], 'lr': cfg.train.lr_head}
+        {'params': model.module.score_head.parameters(), 'lr': cfg.train.lr_head}
     ]
     
     optimizer = optim.AdamW(param_groups, weight_decay=cfg.train.weight_decay)
 
     if local_rank == 0:
-        print(f"--- Training Learned Multi-Head Clusters ---")
+        print(f"--- Training Pure Regression (No Color Jitter) ---")
 
     for epoch in range(cfg.train.epochs):
         train_sampler.set_epoch(epoch)
@@ -130,7 +132,7 @@ def main():
             strict, relaxed = validate(model, val_df, cfg, device)
             print(f"Epoch {epoch+1} | Loss: {loss:.4f} | Strict: {strict:.4f} | Relaxed: {relaxed:.4f}")
             
-            if relaxed > 0.65:
+            if relaxed > 0.70:
                 torch.save(model.module.state_dict(), f"checkpoint_epoch_{epoch+1}.pth")
 
     cleanup_ddp()
