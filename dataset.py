@@ -9,7 +9,7 @@ class PropertyPreferenceDataset(Dataset):
     def __init__(self, csv_path_or_df, model_name='mobileclip_b', pretrained_path=None, img_size=336, is_train=False):
         self.img_size = img_size
         self.is_train = is_train
-        self.data = []
+        self.pairs = []
         
         mean = (0.485, 0.456, 0.406)
         std = (0.229, 0.224, 0.225)
@@ -36,12 +36,30 @@ class PropertyPreferenceDataset(Dataset):
         df['file_path'] = df.index.map(lambda x: f"images/{x}.jpg")
         df = df[df['file_path'].apply(os.path.exists)]
         
-        for _, row in df.iterrows():
-            self.data.append({
-                'path': row['file_path'],
-                'score': float(row['score']) / 10.0
-            })
-
+        if 'group_id' in df.columns and 'label' in df.columns:
+            groups = df.groupby(['group_id', 'label'])
+            for _, group in groups:
+                records = group.to_dict('records')
+                n = len(records)
+                if n < 2: continue
+                
+                for i in range(n):
+                    for j in range(n):
+                        if i == j: continue
+                        
+                        score_a = records[i]['score']
+                        score_b = records[j]['score']
+                        
+                        # Only pairs where A > B
+                        if score_a > score_b:
+                            diff = (score_a - score_b) / 10.0 # Normalize 0.0-1.0
+                            
+                            self.pairs.append({
+                                'win_path': records[i]['file_path'],
+                                'lose_path': records[j]['file_path'],
+                                'diff': diff
+                            })
+                            
     def _load_local(self, path):
         try:
             img = Image.open(path).convert('RGB')
@@ -59,9 +77,11 @@ class PropertyPreferenceDataset(Dataset):
         return self.transform(background)
 
     def __getitem__(self, idx):
-        item = self.data[idx]
-        img_tensor = self._load_local(item['path'])
-        return img_tensor, torch.tensor(item['score'], dtype=torch.float32)
+        item = self.pairs[idx]
+        win = self._load_local(item['win_path'])
+        lose = self._load_local(item['lose_path'])
+        diff = torch.tensor(item['diff'], dtype=torch.float32)
+        return win, lose, diff
 
     def __len__(self):
-        return len(self.data)
+        return len(self.pairs)
