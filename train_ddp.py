@@ -1,7 +1,6 @@
 import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -28,18 +27,43 @@ def setup_ddp():
 def cleanup_ddp():
     if dist.is_initialized(): dist.destroy_process_group()
 
-def listnet_loss(pred_scores, gt_scores, mask, temperature=1.0):
-    gt_scores = gt_scores.clone()
-    gt_scores[mask == 0] = -1e9
+def dynamic_margin_loss(pred_scores, gt_scores, valid_len):
+    """
+    Computes Hinge Loss for EVERY valid pair in the group.
+    Margin is dynamic based on GT difference.
+    """
+    device = pred_scores.device
+    loss = torch.tensor(0.0, device=device)
+    n_pairs = 0
     
-    gt_probs = F.softmax(gt_scores / temperature, dim=1)
-    
-    pred_scores = pred_scores.clone()
-    pred_scores[mask == 0] = -1e9
-    pred_log_probs = F.log_softmax(pred_scores, dim=1)
-    
-    loss = -torch.sum(gt_probs * pred_log_probs, dim=1)
-    return loss.mean()
+    for b in range(pred_scores.shape[0]):
+        n_imgs = int(valid_len[b])
+        p_scores = pred_scores[b, :n_imgs]
+        g_scores = gt_scores[b, :n_imgs]
+        
+        p_diff_mat = p_scores.unsqueeze(0) - p_scores.unsqueeze(1)
+        
+
+        g_diff_mat = g_scores.unsqueeze(0) - g_scores.unsqueeze(1)
+        
+        pair_mask = g_diff_mat > 0
+        
+        if pair_mask.sum() == 0:
+            continue
+            
+
+        dynamic_margins = g_diff_mat[pair_mask] * 0.1
+        
+        preds = p_diff_mat[pair_mask]
+        
+        pair_losses = torch.relu(dynamic_margins - preds)
+        
+        loss += pair_losses.mean()
+        n_pairs += 1
+        
+    if n_pairs > 0:
+        return loss / n_pairs
+    return loss
 
 def validate(model, df_val, cfg, device):
     model.eval()
@@ -70,9 +94,7 @@ def validate(model, df_val, cfg, device):
             if len(images) < 2: continue
             
             batch = torch.stack(images).unsqueeze(0).to(device)
-            mask = torch.ones(1, len(images)).to(device)
-            
-            pred_scores = model(batch, mask=mask).view(-1).cpu().numpy()
+            pred_scores = model(batch).view(-1).cpu().numpy()
             
             best_pred_idx = np.argmax(pred_scores)
             score_of_model_choice = gt_scores[best_pred_idx]
@@ -92,7 +114,7 @@ def main():
     np.random.seed(cfg.train.seed)
     
     df = pd.read_csv(cfg.data.csv_path)
-    gkf = GroupKFold(n_splits=5)
+    gkf = GroupKFold(n_splits=cfg.data.n_splits)
     train_idx, val_idx = next(gkf.split(df, groups=df['group_id']))
     train_df = df.iloc[train_idx]
     val_df = df.iloc[val_idx]
@@ -112,12 +134,10 @@ def main():
     if dist.is_initialized():
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
     
-    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), 
-                           lr=cfg.train.lr_head, 
-                           weight_decay=cfg.train.weight_decay)
+    optimizer = optim.AdamW(model.module.head.parameters(), lr=cfg.train.lr_head, weight_decay=cfg.train.weight_decay)
     
     if rank == 0:
-        print(f"Training Context-Aware Ranker on {len(train_ds)} properties.")
+        print(f"Training on {len(train_ds)} properties (95% Split).")
 
     for epoch in range(cfg.train.epochs):
         if dist.is_initialized(): sampler.set_epoch(epoch)
@@ -126,14 +146,13 @@ def main():
         
         iterator = tqdm(train_loader, desc=f"Epoch {epoch+1}") if rank == 0 else train_loader
         
-        for img_stack, score_stack, mask in iterator:
-            img_stack, score_stack, mask = img_stack.to(device), score_stack.to(device), mask.to(device)
+        for img_stack, score_stack, valid_len in iterator:
+            img_stack, score_stack = img_stack.to(device), score_stack.to(device)
             
             optimizer.zero_grad()
+            pred_scores = model(img_stack)
             
-            pred_scores = model(img_stack, mask=mask)
-            
-            loss = listnet_loss(pred_scores, score_stack, mask, temperature=1.0)
+            loss = dynamic_margin_loss(pred_scores, score_stack, valid_len)
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)

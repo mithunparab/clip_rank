@@ -39,7 +39,6 @@ class PropertyPreferenceDataset(Dataset):
                 scale = self.img_size / max(w, h)
                 new_w, new_h = int(w * scale), int(h * scale)
                 img_resized = img.resize((new_w, new_h), Image.Resampling.BICUBIC)
-                
                 canvas = Image.new('RGB', (self.img_size, self.img_size), (0, 0, 0))
                 x_offset = (self.img_size - new_w) // 2
                 y_offset = (self.img_size - new_h) // 2
@@ -53,7 +52,6 @@ class PropertyPreferenceDataset(Dataset):
 
     def __getitem__(self, idx):
         records = self.groups[idx]
-        
         current_len = min(len(records), self.max_len)
         selected = records[:current_len]
         
@@ -71,11 +69,6 @@ class PropertyPreferenceDataset(Dataset):
         if pad_len > 0:
             for _ in range(pad_len):
                 image_tensors.append(torch.zeros(3, self.img_size, self.img_size))
-                scores.append(-1e9)
+                scores.append(-100.0)
         
-        img_stack = torch.stack(image_tensors)
-        score_stack = torch.tensor(scores, dtype=torch.float32)
-        
-        mask = torch.cat([torch.ones(current_len), torch.zeros(pad_len)])
-        
-        return img_stack, score_stack, mask
+        return torch.stack(image_tensors), torch.tensor(scores, dtype=torch.float32), torch.tensor(current_len)
