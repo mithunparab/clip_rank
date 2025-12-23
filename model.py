@@ -9,7 +9,6 @@ class MobileCLIPRanker(nn.Module):
         super().__init__()
         
         ckpt_path = self._download_weights(cfg.model.name)
-        
         print(f"Loading Backbone from {ckpt_path}...")
         model, _, _ = mobileclip.create_model_and_transforms(
             cfg.model.name, 
@@ -18,13 +17,18 @@ class MobileCLIPRanker(nn.Module):
         self.backbone = model.image_encoder
         self.backbone_dim = 512 
         
+        self.backbone.eval()
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+            
         self.head = nn.Sequential(
             nn.Dropout(p=cfg.model.dropout),
             nn.Linear(self.backbone_dim, cfg.model.head_hidden_dim),
             nn.LayerNorm(cfg.model.head_hidden_dim),
             nn.GELU(),
-            nn.Linear(cfg.model.head_hidden_dim, 1)
+            nn.Linear(cfg.model.head_hidden_dim, 1) 
         )
+        
         self.apply(self._init_weights)
 
     def _download_weights(self, model_name):
@@ -32,8 +36,8 @@ class MobileCLIPRanker(nn.Module):
         filename = "mobileclip_b.pt"
         try:
             return hf_hub_download(repo_id=repo_id, filename=filename)
-        except Exception as e:
-            raise RuntimeError(f"Failed to download MobileCLIP weights: {e}")
+        except:
+            raise RuntimeError("Failed to download MobileCLIP weights")
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -42,9 +46,21 @@ class MobileCLIPRanker(nn.Module):
 
     def train(self, mode=True):
         super().train(mode)
-        self.backbone.eval() 
+        self.backbone.eval()
         return self
 
     def forward(self, x):
-        features = self.backbone(x)
-        return self.head(features)
+        # Listwise Input: [Batch, GroupSize, 3, H, W]
+        b, g, c, h, w = x.shape
+        
+        # Flatten: [B*G, 3, H, W]
+        x_flat = x.view(b * g, c, h, w)
+        
+        with torch.no_grad():
+            features = self.backbone(x_flat) # [B*G, 512]
+            
+        scores = self.head(features) # [B*G, 1]
+        
+        # Reshape: [Batch, GroupSize]
+        scores = scores.view(b, g)
+        return scores

@@ -1,6 +1,7 @@
 import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -28,9 +29,28 @@ def setup_ddp():
 def cleanup_ddp():
     if dist.is_initialized(): dist.destroy_process_group()
 
+def listnet_loss(pred_scores, gt_scores, mask, temperature=1.0):
+    """
+    Listwise Loss using KL Divergence.
+    gt_scores: [B, 15] (e.g., 10, 9, 2, -1e9...)
+    pred_scores: [B, 15] (logits)
+    """
+    
+    gt_probs = F.softmax(gt_scores / temperature, dim=1)
+    
+    pred_log_probs = F.log_softmax(pred_scores, dim=1)
+
+    # -Sum( P_gt * log(P_pred) )
+    loss = -torch.sum(gt_probs * pred_log_probs, dim=1)
+    
+    return loss.mean()
+
 def validate(model, df_val, cfg, device):
     model.eval()
-    ds_helper = PropertyPreferenceDataset(pd.DataFrame({'group_id':[], 'score':[]}), images_dir="images", is_train=False, img_size=cfg.data.img_size)
+    ds_helper = PropertyPreferenceDataset(
+        pd.DataFrame({'group_id':[], 'score':[]}), 
+        images_dir="images", is_train=False, img_size=cfg.data.img_size
+    )
     
     if 'file_path' not in df_val.columns:
          df_val = df_val.copy()
@@ -56,7 +76,8 @@ def validate(model, df_val, cfg, device):
                 
             if len(images) < 2: continue
             
-            batch = torch.stack(images).to(device)
+            batch = torch.stack(images).unsqueeze(0).to(device)
+            
             pred_scores = model(batch).view(-1).cpu().numpy()
             
             best_pred_idx = np.argmax(pred_scores)
@@ -64,7 +85,9 @@ def validate(model, df_val, cfg, device):
             max_gt_score = max(gt_scores)
             
             if score_of_model_choice == max_gt_score: strict_wins += 1
+            
             if score_of_model_choice >= (max_gt_score - 1.0): relaxed_wins += 1
+            
             total_groups += 1
             
     if total_groups == 0: return 0.0, 0.0
@@ -82,13 +105,24 @@ def main():
     train_df = df.iloc[train_idx]
     val_df = df.iloc[val_idx]
     
-    train_ds = PropertyPreferenceDataset(train_df, images_dir="images", is_train=True, img_size=cfg.data.img_size)
+    train_ds = PropertyPreferenceDataset(
+        train_df, 
+        images_dir="images", 
+        is_train=True, 
+        img_size=cfg.data.img_size,
+        max_len=cfg.data.max_images_per_group
+    )
     
     sampler = DistributedSampler(train_ds, shuffle=True) if dist.is_initialized() else None
+    
     train_loader = DataLoader(
-        train_ds, batch_size=cfg.train.batch_size, sampler=sampler, 
-        num_workers=cfg.system.num_workers, pin_memory=cfg.system.pin_memory, 
-        shuffle=(sampler is None), drop_last=True
+        train_ds, 
+        batch_size=cfg.train.batch_size,
+        sampler=sampler, 
+        num_workers=cfg.system.num_workers, 
+        pin_memory=cfg.system.pin_memory, 
+        shuffle=(sampler is None), 
+        drop_last=True
     )
     
     device = torch.device(f"cuda:{local_rank}")
@@ -97,18 +131,10 @@ def main():
     if dist.is_initialized():
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
     
-    criterion = nn.MarginRankingLoss(margin=cfg.train.margin)
-    
-    param_groups = [
-        {'params': model.module.backbone.parameters(), 'lr': cfg.train.lr_backbone},
-        {'params': model.module.head.parameters(), 'lr': cfg.train.lr_head}
-    ]
-    optimizer = optim.AdamW(param_groups, weight_decay=cfg.train.weight_decay)
-    
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.train.epochs)
+    optimizer = optim.AdamW(model.module.head.parameters(), lr=cfg.train.lr_head, weight_decay=cfg.train.weight_decay)
     
     if rank == 0:
-        print(f"Training on {len(train_ds)} Anchor-Best pairs.")
+        print(f"Listwise Training on {len(train_ds)} properties (Frozen Backbone).")
 
     for epoch in range(cfg.train.epochs):
         if dist.is_initialized(): sampler.set_epoch(epoch)
@@ -117,23 +143,22 @@ def main():
         
         iterator = tqdm(train_loader, desc=f"Epoch {epoch+1}") if rank == 0 else train_loader
         
-        for win_imgs, lose_imgs, targets in iterator:
-            win_imgs, lose_imgs = win_imgs.to(device), lose_imgs.to(device)
-            targets = targets.to(device).view(-1) 
+        for img_stack, score_stack, mask in iterator:
+            img_stack = img_stack.to(device)     # [B, 15, 3, 336, 336]
+            score_stack = score_stack.to(device) # [B, 15]
+            mask = mask.to(device)
             
             optimizer.zero_grad()
-            combined = torch.cat([win_imgs, lose_imgs], dim=0)
-            all_scores = model(combined)
-            s_win, s_lose = torch.split(all_scores, win_imgs.size(0))
             
-            loss = criterion(s_win.view(-1), s_lose.view(-1), targets)
+            pred_scores = model(img_stack)       # [B, 15]
+            
+            # Listwise Loss
+            loss = listnet_loss(pred_scores, score_stack, mask, temperature=cfg.train.gt_temperature)
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
             optimizer.step()
             total_loss += loss.item()
-        
-        scheduler.step()
         
         if rank == 0:
             avg_loss = total_loss / len(train_loader)
