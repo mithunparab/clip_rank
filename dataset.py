@@ -8,10 +8,6 @@ import os
 
 class PropertyPreferenceDataset(Dataset):
     def __init__(self, df, images_dir="images", is_train=False, img_size=336):
-        """
-        df: DataFrame containing ['group_id', 'score'] (and optional 'file_path')
-        images_dir: Directory where images are saved (e.g. 'images/{index}.jpg')
-        """
         self.img_size = img_size
         self.is_train = is_train
         self.pairs = []
@@ -29,11 +25,10 @@ class PropertyPreferenceDataset(Dataset):
             std=(0.229, 0.224, 0.225)
         )
 
-
         if not self.df.empty:
             grouped = self.df.groupby('group_id')
             
-            for _, group in grouped:
+            for group_id, group in grouped:
                 if len(group) < 2: continue
                 
                 records = group.to_dict('records')
@@ -43,38 +38,35 @@ class PropertyPreferenceDataset(Dataset):
                     for j in range(n):
                         if i == j: continue
                         
-                        s_i = records[i]['score']
-                        s_j = records[j]['score']
+                        score_a = records[i]['score']
+                        score_b = records[j]['score']
                         
-                        if s_i > s_j:
+                        if score_a >= (score_b + 1.0):
                             self.pairs.append({
                                 'win_path': records[i]['file_path'],
                                 'lose_path': records[j]['file_path'],
-                                'score_diff': s_i - s_j
+                                'group_id': group_id  
                             })
 
     def _letterbox_image(self, img_path):
         """
-        Resize longest side to 336, pad rest with black. Preserves FOV.
+        Resizes to 336x336 while preserving FOV (geometry).
         """
         try:
             with Image.open(img_path) as img:
                 img = img.convert('RGB')
-                
                 w, h = img.size
                 scale = self.img_size / max(w, h)
-                new_w = int(w * scale)
-                new_h = int(h * scale)
-
+                new_w, new_h = int(w * scale), int(h * scale)
+                
                 img_resized = img.resize((new_w, new_h), Image.Resampling.BICUBIC)
-
+                
                 canvas = Image.new('RGB', (self.img_size, self.img_size), (0, 0, 0))
                 x_offset = (self.img_size - new_w) // 2
                 y_offset = (self.img_size - new_h) // 2
                 canvas.paste(img_resized, (x_offset, y_offset))
                 return canvas
-        except Exception as e:
-            print(f"Warning: Corrupt image {img_path}")
+        except:
             return Image.new('RGB', (self.img_size, self.img_size), (0, 0, 0))
 
     def __len__(self):

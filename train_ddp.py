@@ -10,6 +10,7 @@ import pandas as pd
 import numpy as np
 from sklearn.model_selection import GroupKFold
 from tqdm import tqdm
+from torchvision import transforms
 
 from dataset import PropertyPreferenceDataset
 from model import MobileCLIPRanker
@@ -29,9 +30,19 @@ def cleanup_ddp():
         dist.destroy_process_group()
 
 def validate(model, df_val, cfg, device):
+    """
+    Validation Metric:
+    For each property in the validation set, we pass ALL its images to the model.
+    We check if the model assigns the highest score to the image that actually has the highest score.
+    """
     model.eval()
     
-    ds_helper = PropertyPreferenceDataset(df_val, images_dir="images", is_train=False, img_size=cfg.data.img_size)
+    ds_helper = PropertyPreferenceDataset(
+        pd.DataFrame({'group_id':[], 'score':[]}), 
+        images_dir="images", 
+        is_train=False, 
+        img_size=cfg.data.img_size
+    )
     
     if 'file_path' not in df_val.columns:
          df_val = df_val.copy()
@@ -66,10 +77,12 @@ def validate(model, df_val, cfg, device):
             
             best_pred_idx = np.argmax(pred_scores)
             score_of_model_choice = gt_scores[best_pred_idx]
+            
             max_gt_score = max(gt_scores)
             
             if score_of_model_choice == max_gt_score:
                 strict_wins += 1
+            
             if score_of_model_choice >= (max_gt_score - 1.0):
                 relaxed_wins += 1
                 
@@ -82,6 +95,7 @@ def main():
     rank, local_rank = setup_ddp()
     cfg = load_config("config.yml")
     
+    # Reproducibility
     torch.manual_seed(cfg.train.seed)
     np.random.seed(cfg.train.seed)
     
@@ -126,7 +140,7 @@ def main():
     optimizer = optim.AdamW(param_groups, weight_decay=cfg.train.weight_decay)
     
     if rank == 0:
-        print(f"Training on {len(train_ds)} pairs | Validation on {len(val_df)} images")
+        print(f"Training on {len(train_ds)} intra-group pairs.")
 
     for epoch in range(cfg.train.epochs):
         if dist.is_initialized():
@@ -160,8 +174,9 @@ def main():
             avg_loss = total_loss / len(train_loader)
             strict, relaxed = validate(model.module, val_df, cfg, device)
             
-            print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Strict: {strict:.2%} | Relaxed: {relaxed:.2%}")
+            print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Strict Top-1: {strict:.2%} | Relaxed Top-1: {relaxed:.2%}")
             
+
             if relaxed > 0.65:
                 torch.save(model.module.state_dict(), f"{cfg.train.save_dir}/epoch_{epoch+1}.pth")
 
