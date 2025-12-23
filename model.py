@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import mobileclip
 
 class MobileCLIPRanker(nn.Module):
@@ -17,21 +16,24 @@ class MobileCLIPRanker(nn.Module):
             dummy = torch.zeros(1, 3, cfg.data.img_size, cfg.data.img_size)
             dim = self.backbone(dummy).shape[1]
             
-
-        self.anchors = nn.Parameter(torch.randn(cfg.model.num_anchors, dim))
-        nn.init.orthogonal_(self.anchors)
+        self.score_head = nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Linear(dim, cfg.model.head_hidden_dim),
+            nn.LayerNorm(cfg.model.head_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(cfg.model.head_hidden_dim, 1),
+            nn.Sigmoid() 
+        )
         
-        self.scale = nn.Parameter(torch.tensor(10.0))
-        self.bias = nn.Parameter(torch.tensor(-3.0)) 
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
-        img_feats = self.backbone(x)
-        img_feats = F.normalize(img_feats, dim=-1)
-        
-        anchor_feats = F.normalize(self.anchors, dim=-1)
-        
-        sims = img_feats @ anchor_feats.T
-        
-        best_sim, _ = sims.max(dim=1)
-        
-        return torch.sigmoid((best_sim * self.scale) + self.bias)
+        features = self.backbone(x)
+        return self.score_head(features)
