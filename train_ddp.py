@@ -100,13 +100,17 @@ def validate(model, df_val, cfg, device):
     if total_groups == 0: return 0.0, 0.0
     return strict_wins / total_groups, relaxed_wins / total_groups
 
-def save_checkpoint(model, optimizer, epoch, path):
+def save_checkpoint(model, optimizer, epoch, path, is_best=False):
     checkpoint = {
         'epoch': epoch,
         'model_state_dict': model.module.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
     }
     torch.save(checkpoint, path)
+    if is_best:
+        # Save a copy as best_model.pth
+        best_path = os.path.join(os.path.dirname(path), "best_model.pth")
+        torch.save(checkpoint, best_path)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -143,7 +147,10 @@ def main():
     trainable_params = filter(lambda p: p.requires_grad, model.parameters())
     optimizer = optim.AdamW(trainable_params, lr=cfg.train.lr_head, weight_decay=cfg.train.weight_decay)
     
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.train.epochs, eta_min=1e-6)
+    
     start_epoch = 0
+    best_score = 0.0 
 
     if args.resume and os.path.isfile(args.resume):
         if rank == 0: print(f"--> Loading checkpoint: {args.resume}")
@@ -153,8 +160,9 @@ def main():
             try:
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 start_epoch = checkpoint['epoch']
+                if rank == 0: print(f"--> Resuming from Epoch {start_epoch}")
             except:
-                if rank == 0: print("--> Optimizer mismatch (architecture changed), starting optimizer fresh.")
+                if rank == 0: print("--> Optimizer mismatch, starting fresh.")
         else:
             model.module.load_state_dict(checkpoint, strict=False)
             
@@ -181,15 +189,23 @@ def main():
             optimizer.step()
             total_loss += loss.item()
         
+        scheduler.step()
+        
         if rank == 0:
             avg_loss = total_loss / len(train_loader)
             strict, relaxed = validate(model.module, val_df, cfg, device)
             
-            print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Strict: {strict:.2%} | Relaxed: {relaxed:.2%}")
+            current_score = strict + relaxed 
+            is_best = current_score > best_score
+            if is_best:
+                best_score = current_score
             
-            if relaxed > 0.65 or (epoch+1) % 10 == 0:
-                os.makedirs(cfg.train.save_dir, exist_ok=True)
-                save_checkpoint(model, optimizer, epoch + 1, f"{cfg.train.save_dir}/epoch_{epoch+1}.pth")
+            print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Strict: {strict:.2%} | Relaxed: {relaxed:.2%} | Best: {best_score:.2%}")
+            
+            os.makedirs(cfg.train.save_dir, exist_ok=True)
+            save_path = f"{cfg.train.save_dir}/epoch_{epoch+1}.pth"
+            
+            save_checkpoint(model, optimizer, epoch + 1, save_path, is_best=is_best)
 
     cleanup_ddp()
 
