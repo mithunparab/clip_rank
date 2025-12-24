@@ -43,7 +43,7 @@ def dynamic_margin_loss(pred_scores, gt_scores, valid_len):
         
         pair_mask = g_diff_mat > 0
         if pair_mask.sum() == 0: continue
-        
+            
         dynamic_margins = g_diff_mat[pair_mask] * 0.1 
         preds = p_diff_mat[pair_mask]
         
@@ -110,7 +110,7 @@ def save_checkpoint(model, optimizer, epoch, path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--resume', type=str, default=None, help='Path to .pth file to resume from')
+    parser.add_argument('--resume', type=str, default=None)
     args = parser.parse_args()
 
     rank, local_rank = setup_ddp()
@@ -140,38 +140,26 @@ def main():
     if dist.is_initialized():
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
     
-    optimizer = optim.AdamW(model.module.head.parameters(), lr=cfg.train.lr_head, weight_decay=cfg.train.weight_decay)
+    trainable_params = filter(lambda p: p.requires_grad, model.parameters())
+    optimizer = optim.AdamW(trainable_params, lr=cfg.train.lr_head, weight_decay=cfg.train.weight_decay)
     
     start_epoch = 0
 
-    if args.resume:
-        if os.path.isfile(args.resume):
-            if rank == 0:
-                print(f"--> Loading checkpoint: {args.resume}")
-            
-            checkpoint = torch.load(args.resume, map_location=device)
-            
-            if 'model_state_dict' in checkpoint:
-                model.module.load_state_dict(checkpoint['model_state_dict'])
+    if args.resume and os.path.isfile(args.resume):
+        if rank == 0: print(f"--> Loading checkpoint: {args.resume}")
+        checkpoint = torch.load(args.resume, map_location=device)
+        if 'model_state_dict' in checkpoint:
+            model.module.load_state_dict(checkpoint['model_state_dict'])
+            try:
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 start_epoch = checkpoint['epoch']
-                if rank == 0: print(f"--> Resuming from Epoch {start_epoch}")
-            else:
-                state_dict = checkpoint
-                new_state_dict = {}
-                for k, v in state_dict.items():
-                    if k.startswith('module.'):
-                        new_state_dict[k] = v
-                    else:
-                        new_state_dict[f'module.{k}'] = v
-                
-                model.load_state_dict(new_state_dict)
-                if rank == 0: print("--> Weights loaded. Restarting optimizer fresh (Fine-tuning continuation).")
+            except:
+                if rank == 0: print("--> Optimizer mismatch (architecture changed), starting optimizer fresh.")
         else:
-            if rank == 0: print(f"--> Error: No checkpoint found at {args.resume}")
-
+            model.module.load_state_dict(checkpoint, strict=False)
+            
     if rank == 0:
-        print(f"Training on {len(train_ds)} properties (95% Split). Val set size: {len(val_df)}")
+        print(f"Training Directional Ranker on {len(train_ds)} properties (95% Split).")
 
     for epoch in range(start_epoch, cfg.train.epochs):
         if dist.is_initialized(): sampler.set_epoch(epoch)
@@ -199,10 +187,9 @@ def main():
             
             print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Strict: {strict:.2%} | Relaxed: {relaxed:.2%}")
             
-            if relaxed > 0.65 or (epoch + 1) % 5 == 0:
+            if relaxed > 0.65 or (epoch+1) % 10 == 0:
                 os.makedirs(cfg.train.save_dir, exist_ok=True)
-                save_path = f"{cfg.train.save_dir}/epoch_{epoch+1}.pth"
-                save_checkpoint(model, optimizer, epoch + 1, save_path)
+                save_checkpoint(model, optimizer, epoch + 1, f"{cfg.train.save_dir}/epoch_{epoch+1}.pth")
 
     cleanup_ddp()
 
