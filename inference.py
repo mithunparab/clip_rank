@@ -8,6 +8,7 @@ from io import BytesIO
 from types import SimpleNamespace
 from torchvision import transforms
 import numpy as np
+
 from model import MobileCLIPRanker
 import mobileclip
 
@@ -27,21 +28,31 @@ class PropertyRanker:
         self.cfg = load_config(config_path)
         self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
         
-        print(f"--- Loading Directional Ranker ---")
+        print(f"--- Loading Ranker ---")
+        print(f"Device: {self.device}")
+        print(f"Weights: {model_path}")
+        
         self.model = MobileCLIPRanker(self.cfg)
         
-        checkpoint = torch.load(model_path, map_location=self.device)
-        
-        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            raw_state_dict = checkpoint['model_state_dict']
-        else:
-            raw_state_dict = checkpoint
+        try:
+            checkpoint = torch.load(model_path, map_location=self.device)
+            
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                raw_state_dict = checkpoint['model_state_dict']
+            else:
+                raw_state_dict = checkpoint
 
-        state_dict = {k.replace("module.", ""): v for k, v in raw_state_dict.items()}
-        
-        self.model.load_state_dict(state_dict, strict=False)
-        self.model.to(self.device)
-        self.model.eval()
+            state_dict = {k.replace("module.", ""): v for k, v in raw_state_dict.items()}
+            
+            self.model.load_state_dict(state_dict, strict=False)
+            self.model.to(self.device)
+            self.model.eval()
+            print("Model loaded successfully.\n")
+            
+        except Exception as e:
+            print(f"\nCRITICAL ERROR LOADING WEIGHTS: {e}")
+            print("Ensure model.py architecture matches the checkpoint.")
+            exit()
         
         self.normalize = transforms.Normalize(
             mean=(0.485, 0.456, 0.406), 
@@ -64,6 +75,8 @@ class PropertyRanker:
         valid_tensors = []
         valid_indices = []
         
+        print(f"Processing {len(image_list)} images...")
+        
         for i, src in enumerate(image_list):
             try:
                 if src.startswith("http"):
@@ -75,9 +88,10 @@ class PropertyRanker:
                 valid_tensors.append(tensor)
                 valid_indices.append(i)
             except Exception as e:
-                print(f"Error: {e}")
+                print(f"Error loading image {i}: {e}")
         
-        if not valid_tensors: return []
+        if not valid_tensors:
+            return []
 
         batch = torch.stack(valid_tensors).unsqueeze(0).to(self.device)
         valid_len = torch.tensor([len(valid_tensors)]).to(self.device)
@@ -92,36 +106,34 @@ class PropertyRanker:
         results.sort(key=lambda x: x['score'], reverse=True)
         return results
 
-
 if __name__ == "__main__":
     checkpoints = sorted(glob.glob("checkpoints/*.pth"), key=os.path.getmtime)
     
-    if not checkpoints:
-        print("Error: No checkpoints found.")
-        exit()
+    if checkpoints:
+        latest_model = checkpoints[-1]
+        print(f"Using: {latest_model}")
         
-    latest_model = checkpoints[-1]
-    ranker = PropertyRanker(model_path=latest_model)
-    
-    test_urls = [
-        "https://ap.rdcpix.com/69fe76be4fd818c9b1e25b8b6c79432el-m3865337706s-w2048_h1536.jpg",
-        "https://ap.rdcpix.com/69fe76be4fd818c9b1e25b8b6c79432el-m1211374265s-w2048_h1536.jpg",
-        "https://ap.rdcpix.com/69fe76be4fd818c9b1e25b8b6c79432el-m713883090s-w2048_h1536.jpg",
-        "https://ap.rdcpix.com/c3065cb0efd74e0e69c634c4e7926ed0l-m3456441259s-w2048_h1536.jpg"
-    ]
-    
-    ranked_results = ranker.rank(test_urls)
-    
-    print("\n" + "="*50)
-    print(f"RANKING RESULTS (Best to Worst)")
-    print("="*50)
-    
-    if ranked_results:
-        print(f"\n🏆 WINNER (Score: {ranked_results[0]['score']:.4f})")
-        print(f"   URL: {ranked_results[0]['source']}")
+        ranker = PropertyRanker(model_path=latest_model)
         
-        print("\nRunners Up:")
-        for i, res in enumerate(ranked_results[1:], 1):
-            print(f"{i}. Score: {res['score']:.4f} | {res['source']}")
+        test_urls = [
+            "https://ap.rdcpix.com/69fe76be4fd818c9b1e25b8b6c79432el-m3865337706s-w2048_h1536.jpg",
+            "https://ap.rdcpix.com/69fe76be4fd818c9b1e25b8b6c79432el-m1211374265s-w2048_h1536.jpg",
+            "https://ap.rdcpix.com/69fe76be4fd818c9b1e25b8b6c79432el-m713883090s-w2048_h1536.jpg",
+            "https://ap.rdcpix.com/c3065cb0efd74e0e69c634c4e7926ed0l-m3456441259s-w2048_h1536.jpg"
+        ]
+        
+        ranked_results = ranker.rank(test_urls)
+        
+        print("\n" + "="*50)
+        print(f"RANKING RESULTS (Best to Worst)")
+        print("="*50)
+        
+        if ranked_results:
+            print(f"\n🏆 WINNER (Score: {ranked_results[0]['score']:.4f})")
+            print(f"   Source: {ranked_results[0]['source']}")
             
-    print("="*50)
+            print("\nRunners Up:")
+            for i, res in enumerate(ranked_results[1:], 1):
+                print(f"{i}. Score: {res['score']:.4f} | {res['source']}")
+    else:
+        print("No checkpoints found in 'checkpoints/' directory.")
