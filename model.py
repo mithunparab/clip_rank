@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import mobileclip
-import numpy as np
 from huggingface_hub import hf_hub_download
+import numpy as np
 
 class MobileCLIPRanker(nn.Module):
     def __init__(self, cfg):
@@ -18,15 +18,16 @@ class MobileCLIPRanker(nn.Module):
         self.backbone.eval()
         for param in self.backbone.parameters():
             param.requires_grad = False
-            
-        self.ideal_vector = nn.Parameter(torch.randn(1, 1, self.backbone_dim))
-        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07)) 
 
         self.projector = nn.Sequential(
             nn.Linear(self.backbone_dim, self.backbone_dim),
             nn.LayerNorm(self.backbone_dim),
             nn.GELU()
         )
+        
+        self.ideal_vector = nn.Parameter(torch.randn(1, 1, self.backbone_dim))
+        
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
         
         self.apply(self._init_weights)
 
@@ -44,25 +45,28 @@ class MobileCLIPRanker(nn.Module):
         return self
 
     def forward(self, x, valid_lens=None):
+        # x: [Batch, GroupSize, 3, H, W]
         b, g, c, h, w = x.shape
         x_flat = x.view(b * g, c, h, w)
         
         with torch.no_grad():
-            features = self.backbone(x_flat) 
+            features = self.backbone(x_flat) # [B*G, 512]
             
-        features = features.view(b, g, -1) 
+        features = features.view(b, g, -1) # [B, G, 512]
         
         if valid_lens is not None:
+            # Create mask: [B, G, 1]
             mask = torch.arange(g, device=x.device).expand(b, g) < valid_lens.unsqueeze(1)
             mask = mask.unsqueeze(-1).float()
+            
             sum_features = (features * mask).sum(dim=1, keepdim=True)
-            mean_features = sum_features / valid_lens.view(b, 1, 1)
+            mean_features = sum_features / (valid_lens.view(b, 1, 1) + 1e-6)
         else:
             mean_features = features.mean(dim=1, keepdim=True)
             
         centered_features = features - mean_features 
         
-        projected = self.projector(centered_features) 
+        projected = self.projector(centered_features) # [B, G, 512]
         
         projected_norm = F.normalize(projected, p=2, dim=2)
         ideal_norm = F.normalize(self.ideal_vector, p=2, dim=2)
