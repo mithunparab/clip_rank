@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import mobileclip
 from huggingface_hub import hf_hub_download
 
@@ -17,14 +18,13 @@ class MobileCLIPRanker(nn.Module):
         for param in self.backbone.parameters():
             param.requires_grad = False
             
-        self.head = nn.Sequential(
-            nn.Linear(self.backbone_dim * 2, cfg.model.head_hidden_dim),
-            nn.LayerNorm(cfg.model.head_hidden_dim),
-            nn.GELU(),
-            nn.Dropout(p=cfg.model.dropout),
-            nn.Linear(cfg.model.head_hidden_dim, 256),
-            nn.GELU(),
-            nn.Linear(256, 1)
+        self.ideal_vector = nn.Parameter(torch.randn(1, 1, self.backbone_dim))
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07)) 
+
+        self.projector = nn.Sequential(
+            nn.Linear(self.backbone_dim, self.backbone_dim),
+            nn.LayerNorm(self.backbone_dim),
+            nn.GELU()
         )
         
         self.apply(self._init_weights)
@@ -34,7 +34,7 @@ class MobileCLIPRanker(nn.Module):
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
-            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            nn.init.orthogonal_(m.weight) 
             if m.bias is not None: nn.init.constant_(m.bias, 0)
 
     def train(self, mode=True):
@@ -47,22 +47,27 @@ class MobileCLIPRanker(nn.Module):
         x_flat = x.view(b * g, c, h, w)
         
         with torch.no_grad():
-            features = self.backbone(x_flat)
+            features = self.backbone(x_flat) 
             
-        features = features.view(b, g, -1)
+        features = features.view(b, g, -1) 
         
         if valid_lens is not None:
             mask = torch.arange(g, device=x.device).expand(b, g) < valid_lens.unsqueeze(1)
             mask = mask.unsqueeze(-1).float()
-            
             sum_features = (features * mask).sum(dim=1, keepdim=True)
             mean_features = sum_features / valid_lens.view(b, 1, 1)
         else:
             mean_features = features.mean(dim=1, keepdim=True)
             
-        diff_features = features - mean_features
+        centered_features = features - mean_features 
         
-        combined = torch.cat([features, diff_features], dim=2)
+        projected = self.projector(centered_features) 
         
-        scores = self.head(combined)
-        return scores.squeeze(-1)
+        projected_norm = F.normalize(projected, p=2, dim=2)
+        ideal_norm = F.normalize(self.ideal_vector, p=2, dim=2)
+        
+        similarity = (projected_norm * ideal_norm).sum(dim=2)
+        
+        scores = similarity * self.logit_scale.exp()
+        
+        return scores

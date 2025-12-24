@@ -43,8 +43,8 @@ def dynamic_margin_loss(pred_scores, gt_scores, valid_len):
         
         pair_mask = g_diff_mat > 0
         if pair_mask.sum() == 0: continue
-            
-        dynamic_margins = g_diff_mat[pair_mask] * 0.1
+        
+        dynamic_margins = g_diff_mat[pair_mask] * 0.1 
         preds = p_diff_mat[pair_mask]
         
         pair_losses = torch.relu(dynamic_margins - preds)
