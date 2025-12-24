@@ -38,9 +38,21 @@ class PropertyRanker:
         
         checkpoint = torch.load(model_path, map_location=self.device)
         
-        state_dict = {k.replace("module.", ""): v for k, v in checkpoint.items()}
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            print("Detected full checkpoint (Training Resume Format). Extracting weights...")
+            raw_state_dict = checkpoint['model_state_dict']
+        else:
+            print("Detected raw weights file.")
+            raw_state_dict = checkpoint
+
+        state_dict = {k.replace("module.", ""): v for k, v in raw_state_dict.items()}
         
-        self.model.load_state_dict(state_dict)
+        try:
+            self.model.load_state_dict(state_dict)
+        except RuntimeError as e:
+            print(f"Warning: Strict load failed ({e}). Retrying with strict=False...")
+            self.model.load_state_dict(state_dict, strict=False)
+
         self.model.to(self.device)
         self.model.eval()
         
@@ -57,9 +69,7 @@ class PropertyRanker:
         new_w, new_h = int(w * scale), int(h * scale)
         
         img_resized = img.resize((new_w, new_h), Image.Resampling.BICUBIC)
-        
         background = Image.new('RGB', (target_size, target_size), (0, 0, 0))
-        
         offset = ((target_size - new_w) // 2, (target_size - new_h) // 2)
         background.paste(img_resized, offset)
         
@@ -90,10 +100,12 @@ class PropertyRanker:
             print("No valid images found.")
             return []
 
+        # Batch: [1, N, 3, H, W]
         batch = torch.stack(valid_tensors).unsqueeze(0).to(self.device)
         valid_len = torch.tensor([len(valid_tensors)]).to(self.device)
         
         with torch.no_grad():
+            # Inference with Group Centering logic
             scores = self.model(batch, valid_lens=valid_len).view(-1).cpu().numpy()
             
         results = []
@@ -110,12 +122,10 @@ if __name__ == "__main__":
     checkpoints = sorted(glob.glob("checkpoints/*.pth"), key=os.path.getmtime)
     
     if not checkpoints:
-        print("Error: No checkpoints found in 'checkpoints/' folder.")
-        print("Run training first!")
+        print("Error: No checkpoints found.")
         exit()
         
     latest_model = checkpoints[-1]
-    
     ranker = PropertyRanker(model_path=latest_model)
     
     test_urls = [
