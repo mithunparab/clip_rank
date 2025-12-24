@@ -107,33 +107,40 @@ class PropertyRanker:
         return results
 
 if __name__ == "__main__":
-    checkpoints = sorted(glob.glob("checkpoints/*.pth"), key=os.path.getmtime)
+    best_model_path = "checkpoints/best_model.pth"
     
-    if checkpoints:
-        latest_model = checkpoints[-1]
-        print(f"Using: {latest_model}")
-        
-        ranker = PropertyRanker(model_path=latest_model)
-        
-        test_urls = [
-            "https://ap.rdcpix.com/69fe76be4fd818c9b1e25b8b6c79432el-m3865337706s-w2048_h1536.jpg",
-            "https://ap.rdcpix.com/69fe76be4fd818c9b1e25b8b6c79432el-m1211374265s-w2048_h1536.jpg",
-            "https://ap.rdcpix.com/69fe76be4fd818c9b1e25b8b6c79432el-m713883090s-w2048_h1536.jpg",
-            "https://ap.rdcpix.com/c3065cb0efd74e0e69c634c4e7926ed0l-m3456441259s-w2048_h1536.jpg"
-        ]
-        
-        ranked_results = ranker.rank(test_urls)
-        
-        print("\n" + "="*50)
-        print(f"RANKING RESULTS (Best to Worst)")
-        print("="*50)
-        
-        if ranked_results:
-            print(f"\n🏆 WINNER (Score: {ranked_results[0]['score']:.4f})")
-            print(f"   Source: {ranked_results[0]['source']}")
-            
-            print("\nRunners Up:")
-            for i, res in enumerate(ranked_results[1:], 1):
-                print(f"{i}. Score: {res['score']:.4f} | {res['source']}")
+    if os.path.exists(best_model_path):
+        model_path = best_model_path
+        print(f"Using Best Saved Model: {model_path}")
     else:
-        print("No checkpoints found in 'checkpoints/' directory.")
+        checkpoints = sorted(glob.glob("checkpoints/*.pth"), key=os.path.getmtime)
+        if not checkpoints:
+            print("Error: No checkpoints found in 'checkpoints/' directory.")
+            exit()
+        model_path = checkpoints[-1]
+        print(f"Using Latest Checkpoint: {model_path}")
+
+    ranker = PropertyRanker(model_path=model_path)
+    
+    test_urls = [
+        "https://ap.rdcpix.com/69fe76be4fd818c9b1e25b8b6c79432el-m3865337706s-w2048_h1536.jpg",
+        "https://ap.rdcpix.com/69fe76be4fd818c9b1e25b8b6c79432el-m1211374265s-w2048_h1536.jpg",
+        "https://ap.rdcpix.com/69fe76be4fd818c9b1e25b8b6c79432el-m713883090s-w2048_h1536.jpg",
+        "https://ap.rdcpix.com/c3065cb0efd74e0e69c634c4e7926ed0l-m3456441259s-w2048_h1536.jpg"
+    ]
+    
+    ranked_results = ranker.rank(test_urls)
+    
+    print("\n" + "="*50)
+    print(f"RANKING RESULTS (Best to Worst)")
+    print("="*50)
+    
+    if ranked_results:
+        print(f"\n🏆 WINNER (Score: {ranked_results[0]['score']:.4f})")
+        print(f"   Source: {ranked_results[0]['source']}")
+        
+        print("\nRunners Up:")
+        for i, res in enumerate(ranked_results[1:], 1):
+            print(f"{i}. Score: {res['score']:.4f} | {res['source']}")
+            
+    print("="*50)
