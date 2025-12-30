@@ -41,6 +41,7 @@ def dynamic_margin_loss(pred_scores, gt_scores, valid_len):
         p_diff_mat = p_scores.unsqueeze(0) - p_scores.unsqueeze(1)
         g_diff_mat = g_scores.unsqueeze(0) - g_scores.unsqueeze(1)
         
+        # We only care about pairs where GT score is strictly greater
         pair_mask = g_diff_mat > 0
         if pair_mask.sum() == 0: continue
             
@@ -48,10 +49,15 @@ def dynamic_margin_loss(pred_scores, gt_scores, valid_len):
         preds = p_diff_mat[pair_mask]
         
         pair_losses = torch.relu(dynamic_margins - preds)
-        loss += pair_losses.mean()
+        loss = loss + pair_losses.mean()
         n_pairs += 1
         
-    return loss / n_pairs if n_pairs > 0 else loss
+    if n_pairs > 0:
+        return loss / n_pairs
+    else:
+        # Crucial Fix: Return a zero loss that is attached to the graph
+        # This prevents "element 0 of tensors does not require grad" error
+        return pred_scores.sum() * 0.0
 
 def validate(model, df_val, cfg, device):
     model.eval()
