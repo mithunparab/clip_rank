@@ -9,7 +9,7 @@ data:
   img_size: 336
   max_images_per_group: 15
   val_fold: 0
-  n_splits: 20 
+  n_splits: 6  
 
 model:
   name: "mobileclip_b"
