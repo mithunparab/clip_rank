@@ -76,6 +76,7 @@ def validate(model, df_val, cfg, device):
     relaxed_wins = 0
     total_groups = 0
     
+    # Debug print
     debug_printed = False
     
     with torch.no_grad():
@@ -156,10 +157,23 @@ def main():
     if dist.is_initialized():
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
     
-    trainable_params = filter(lambda p: p.requires_grad, model.parameters())
-    optimizer = optim.AdamW(trainable_params, lr=cfg.train.lr_head, weight_decay=cfg.train.weight_decay)
+    backbone_params = []
+    head_params = []
     
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.train.epochs, eta_min=1e-5)
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "backbone" in name or "image_encoder" in name:
+            backbone_params.append(param)
+        else:
+            head_params.append(param)
+
+    optimizer = optim.AdamW([
+        {'params': backbone_params, 'lr': cfg.train.lr_backbone},
+        {'params': head_params, 'lr': cfg.train.lr_head}
+    ], weight_decay=cfg.train.weight_decay)
+    
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.train.epochs, eta_min=1e-6)
     
     start_epoch = 0
     best_score = 0.0 
@@ -167,15 +181,13 @@ def main():
     if args.resume and os.path.isfile(args.resume):
         if rank == 0: print(f"--> Loading checkpoint: {args.resume}")
         checkpoint = torch.load(args.resume, map_location=device)
-        if 'model_state_dict' in checkpoint:
+        try:
             model.module.load_state_dict(checkpoint['model_state_dict'])
-            try:
-                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                start_epoch = checkpoint['epoch']
-            except:
-                pass
-        else:
-            model.module.load_state_dict(checkpoint, strict=False)
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            start_epoch = checkpoint['epoch']
+            if rank == 0: print(f"--> Resuming from Epoch {start_epoch}")
+        except:
+             if rank == 0: print("--> Checkpoint structure mismatch, starting fresh.")
             
     if rank == 0:
         print(f"Training Directional Ranker on {len(train_ds)} properties ({(1 - 1/cfg.data.n_splits):.0%} Split).")
