@@ -1,7 +1,11 @@
+================================================
+FILE: train_ddp.py
+================================================
 import os
 import argparse
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -28,33 +32,52 @@ def setup_ddp():
 def cleanup_ddp():
     if dist.is_initialized(): dist.destroy_process_group()
 
-def dynamic_margin_loss(pred_scores, gt_scores, valid_len):
-    device = pred_scores.device
-    loss = 0.0
+def ranknet_loss(pred_scores, gt_scores, valid_len):
+    """
+    RankNet Loss with Score-Difference Weighting.
+    Unlike Margin loss, this provides gradients everywhere.
+    """
+    total_loss = 0.0
     n_pairs = 0
+    
+    bce = nn.BCEWithLogitsLoss(reduction='none')
     
     for b in range(pred_scores.shape[0]):
         n_imgs = int(valid_len[b].item())
+        if n_imgs < 2: continue
+
         p_scores = pred_scores[b, :n_imgs]
         g_scores = gt_scores[b, :n_imgs]
         
-        p_diff_mat = p_scores.unsqueeze(0) - p_scores.unsqueeze(1)
-        g_diff_mat = g_scores.unsqueeze(0) - g_scores.unsqueeze(1)
+        p_diff = p_scores.unsqueeze(0) - p_scores.unsqueeze(1)
+        g_diff = g_scores.unsqueeze(0) - g_scores.unsqueeze(1)
         
-        pair_mask = g_diff_mat > 0
+        pair_mask = g_diff > 0
+        
         if pair_mask.sum() == 0: continue
             
-        dynamic_margins = g_diff_mat[pair_mask] * 0.1 
-        preds = p_diff_mat[pair_mask]
+        # The predicted difference (logits) for these pairs
+        pred_diffs = p_diff[pair_mask]
         
-        pair_losses = torch.relu(dynamic_margins - preds)
-        loss = loss + pair_losses.mean()
-        n_pairs += 1
+        # The target is always 1.0 because we filtered for GT > 0
+        # We want P(i > j) = 1
+        targets = torch.ones_like(pred_diffs)
+        
+        # BASE LOSS: -log(sigmoid(pred_diff))
+        # If pred_diff is high (good), loss is low.
+        # If pred_diff is negative (bad), loss is high.
+        base_loss = bce(pred_diffs, targets)
     
+        weights = torch.log1p(g_diff[pair_mask])
+        
+        weighted_loss = base_loss * weights
+        
+        total_loss = total_loss + weighted_loss.mean()
+        n_pairs += 1
+        
     if n_pairs > 0:
-        return loss / n_pairs
+        return total_loss / n_pairs
     else:
-        # CRASH FIX: Return a zero-loss attached to graph
         return pred_scores.sum() * 0.0
 
 def validate(model, df_val, cfg, device):
@@ -150,6 +173,8 @@ def main():
     trainable_params = filter(lambda p: p.requires_grad, model.parameters())
     optimizer = optim.AdamW(trainable_params, lr=cfg.train.lr_head, weight_decay=cfg.train.weight_decay)
     
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.train.epochs, eta_min=1e-5)
+    
     start_epoch = 0
     best_score = 0.0 
 
@@ -163,7 +188,7 @@ def main():
                 start_epoch = checkpoint['epoch']
                 if rank == 0: print(f"--> Resuming from Epoch {start_epoch}")
             except:
-                if rank == 0: print("--> Optimizer mismatch, starting fresh.")
+                pass
         else:
             model.module.load_state_dict(checkpoint, strict=False)
             
@@ -183,12 +208,14 @@ def main():
             optimizer.zero_grad()
             pred_scores = model(img_stack, valid_lens=valid_len)
             
-            loss = dynamic_margin_loss(pred_scores, score_stack, valid_len)
+            loss = ranknet_loss(pred_scores, score_stack, valid_len)
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
             optimizer.step()
             total_loss += loss.item()
+        
+        scheduler.step()
         
         if rank == 0:
             avg_loss = total_loss / len(train_loader)
