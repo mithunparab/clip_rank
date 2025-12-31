@@ -30,9 +30,7 @@ def cleanup_ddp():
 
 def dynamic_margin_loss(pred_scores, gt_scores, valid_len):
     device = pred_scores.device
-    # Initialize as 0.0 (float), not Tensor, so the first addition 
-    # turns it into a Tensor with a proper gradient history.
-    total_loss = 0.0 
+    loss = 0.0
     n_pairs = 0
     
     for b in range(pred_scores.shape[0]):
@@ -40,11 +38,9 @@ def dynamic_margin_loss(pred_scores, gt_scores, valid_len):
         p_scores = pred_scores[b, :n_imgs]
         g_scores = gt_scores[b, :n_imgs]
         
-        # Vectorized difference matrices
         p_diff_mat = p_scores.unsqueeze(0) - p_scores.unsqueeze(1)
         g_diff_mat = g_scores.unsqueeze(0) - g_scores.unsqueeze(1)
         
-        # Filter for pairs where GT implies a strict preference
         pair_mask = g_diff_mat > 0
         if pair_mask.sum() == 0: continue
             
@@ -52,21 +48,17 @@ def dynamic_margin_loss(pred_scores, gt_scores, valid_len):
         preds = p_diff_mat[pair_mask]
         
         pair_losses = torch.relu(dynamic_margins - preds)
-        
-        # Accumulate
-        total_loss = total_loss + pair_losses.mean()
+        loss = loss + pair_losses.mean()
         n_pairs += 1
-        
+    
     if n_pairs > 0:
-        return total_loss / n_pairs
+        return loss / n_pairs
     else:
-        # Fallback: Return a 0-loss attached to the graph to prevent crashes
-        # but contribute 0 gradient.
+        # CRASH FIX: Return a zero-loss attached to graph
         return pred_scores.sum() * 0.0
 
 def validate(model, df_val, cfg, device):
     model.eval()
-    # Dummy DF for helper init
     ds_helper = PropertyPreferenceDataset(
         pd.DataFrame({'group_id':[], 'score':[]}), 
         images_dir="images", is_train=False, img_size=cfg.data.img_size
@@ -156,8 +148,6 @@ def main():
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
     
     trainable_params = filter(lambda p: p.requires_grad, model.parameters())
-    
-    # REMOVED SCHEDULER to match the "better" older version
     optimizer = optim.AdamW(trainable_params, lr=cfg.train.lr_head, weight_decay=cfg.train.weight_decay)
     
     start_epoch = 0
@@ -178,7 +168,7 @@ def main():
             model.module.load_state_dict(checkpoint, strict=False)
             
     if rank == 0:
-        print(f"Training Directional Ranker on {len(train_ds)} properties (95% Split).")
+        print(f"Training Directional Ranker on {len(train_ds)} properties ({(1 - 1/cfg.data.n_splits):.0%} Split).")
 
     for epoch in range(start_epoch, cfg.train.epochs):
         if dist.is_initialized(): sampler.set_epoch(epoch)
@@ -199,8 +189,6 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
             optimizer.step()
             total_loss += loss.item()
-        
-        # REMOVED scheduler.step()
         
         if rank == 0:
             avg_loss = total_loss / len(train_loader)
