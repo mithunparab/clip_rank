@@ -2,7 +2,6 @@ import os
 import argparse
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -30,46 +29,30 @@ def cleanup_ddp():
     if dist.is_initialized(): dist.destroy_process_group()
 
 def ranknet_loss(pred_scores, gt_scores, valid_len):
-    """
-    RankNet Loss with Score-Difference Weighting.
-    Unlike Margin loss, this provides gradients everywhere.
-    """
     total_loss = 0.0
     n_pairs = 0
-    
     bce = nn.BCEWithLogitsLoss(reduction='none')
     
     for b in range(pred_scores.shape[0]):
         n_imgs = int(valid_len[b].item())
         if n_imgs < 2: continue
 
-        p_scores = pred_scores[b, :n_imgs]
+        p_scores = pred_scores[b, :n_imgs].view(-1)
         g_scores = gt_scores[b, :n_imgs]
         
         p_diff = p_scores.unsqueeze(0) - p_scores.unsqueeze(1)
         g_diff = g_scores.unsqueeze(0) - g_scores.unsqueeze(1)
         
         pair_mask = g_diff > 0
-        
         if pair_mask.sum() == 0: continue
             
-        # The predicted difference (logits) for these pairs
         pred_diffs = p_diff[pair_mask]
-        
-        # The target is always 1.0 because we filtered for GT > 0
-        # We want P(i > j) = 1
         targets = torch.ones_like(pred_diffs)
         
-        # BASE LOSS: -log(sigmoid(pred_diff))
-        # If pred_diff is high (good), loss is low.
-        # If pred_diff is negative (bad), loss is high.
-        base_loss = bce(pred_diffs, targets)
-    
         weights = torch.log1p(g_diff[pair_mask])
         
-        weighted_loss = base_loss * weights
-        
-        total_loss = total_loss + weighted_loss.mean()
+        loss = bce(pred_diffs, targets) * weights
+        total_loss += loss.mean()
         n_pairs += 1
         
     if n_pairs > 0:
@@ -93,6 +76,8 @@ def validate(model, df_val, cfg, device):
     relaxed_wins = 0
     total_groups = 0
     
+    debug_printed = False
+    
     with torch.no_grad():
         for _, group in grouped:
             if len(group) < 2: continue
@@ -112,6 +97,10 @@ def validate(model, df_val, cfg, device):
             valid_len = torch.tensor([len(images)]).to(device)
             
             pred_scores = model(batch, valid_lens=valid_len).view(-1).cpu().numpy()
+            
+            if not debug_printed:
+                print(f"\n[DEBUG] Sample Preds: {pred_scores[:5]} | GT: {gt_scores[:5]}")
+                debug_printed = True
             
             best_pred_idx = np.argmax(pred_scores)
             score_of_model_choice = gt_scores[best_pred_idx]
@@ -183,7 +172,6 @@ def main():
             try:
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 start_epoch = checkpoint['epoch']
-                if rank == 0: print(f"--> Resuming from Epoch {start_epoch}")
             except:
                 pass
         else:
@@ -223,7 +211,7 @@ def main():
             if is_best:
                 best_score = current_score
             
-            print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Strict: {strict:.2%} | Relaxed: {relaxed:.2%} | Best: {best_score:.2%}")
+            print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Strict: {strict:.2%} | Relaxed: {relaxed:.2%} | Best (Combined): {current_score:.2f}")
             
             os.makedirs(cfg.train.save_dir, exist_ok=True)
             save_path = f"{cfg.train.save_dir}/epoch_{epoch+1}.pth"

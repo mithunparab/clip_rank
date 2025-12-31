@@ -14,19 +14,13 @@ data:
 model:
   name: "mobileclip_b"
   head_hidden_dim: 512
-  dropout: 0.5  
+  dropout: 0.2
 
 train:
   batch_size: 1
-  lr_head: 0.0005 
+  lr_head: 0.001  
   epochs: 30
-  weight_decay: 0.1
-  grad_clip: 1.0
-  seed: 42
-  save_dir: "checkpoints"
-  lr_head: 0.001
-  epochs: 40
-  weight_decay: 0.005
+  weight_decay: 0.01
   grad_clip: 1.0
   seed: 42
   save_dir: "checkpoints"
