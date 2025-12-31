@@ -1,3 +1,6 @@
+================================================
+FILE: train_ddp.py
+================================================
 import os
 import argparse
 import torch
@@ -30,7 +33,9 @@ def cleanup_ddp():
 
 def dynamic_margin_loss(pred_scores, gt_scores, valid_len):
     device = pred_scores.device
-    loss = torch.tensor(0.0, device=device)
+    # Initialize as 0.0 (float), not Tensor, so the first addition 
+    # turns it into a Tensor with a proper gradient history.
+    total_loss = 0.0 
     n_pairs = 0
     
     for b in range(pred_scores.shape[0]):
@@ -38,10 +43,11 @@ def dynamic_margin_loss(pred_scores, gt_scores, valid_len):
         p_scores = pred_scores[b, :n_imgs]
         g_scores = gt_scores[b, :n_imgs]
         
+        # Vectorized difference matrices
         p_diff_mat = p_scores.unsqueeze(0) - p_scores.unsqueeze(1)
         g_diff_mat = g_scores.unsqueeze(0) - g_scores.unsqueeze(1)
         
-        # We only care about pairs where GT score is strictly greater
+        # Filter for pairs where GT implies a strict preference
         pair_mask = g_diff_mat > 0
         if pair_mask.sum() == 0: continue
             
@@ -49,18 +55,21 @@ def dynamic_margin_loss(pred_scores, gt_scores, valid_len):
         preds = p_diff_mat[pair_mask]
         
         pair_losses = torch.relu(dynamic_margins - preds)
-        loss = loss + pair_losses.mean()
+        
+        # Accumulate
+        total_loss = total_loss + pair_losses.mean()
         n_pairs += 1
         
     if n_pairs > 0:
-        return loss / n_pairs
+        return total_loss / n_pairs
     else:
-        # Crucial Fix: Return a zero loss that is attached to the graph
-        # This prevents "element 0 of tensors does not require grad" error
+        # Fallback: Return a 0-loss attached to the graph to prevent crashes
+        # but contribute 0 gradient.
         return pred_scores.sum() * 0.0
 
 def validate(model, df_val, cfg, device):
     model.eval()
+    # Dummy DF for helper init
     ds_helper = PropertyPreferenceDataset(
         pd.DataFrame({'group_id':[], 'score':[]}), 
         images_dir="images", is_train=False, img_size=cfg.data.img_size
@@ -114,7 +123,6 @@ def save_checkpoint(model, optimizer, epoch, path, is_best=False):
     }
     torch.save(checkpoint, path)
     if is_best:
-        # Save a copy as best_model.pth
         best_path = os.path.join(os.path.dirname(path), "best_model.pth")
         torch.save(checkpoint, best_path)
 
@@ -151,9 +159,9 @@ def main():
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
     
     trainable_params = filter(lambda p: p.requires_grad, model.parameters())
-    optimizer = optim.AdamW(trainable_params, lr=cfg.train.lr_head, weight_decay=cfg.train.weight_decay)
     
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.train.epochs, eta_min=1e-6)
+    # REMOVED SCHEDULER to match the "better" older version
+    optimizer = optim.AdamW(trainable_params, lr=cfg.train.lr_head, weight_decay=cfg.train.weight_decay)
     
     start_epoch = 0
     best_score = 0.0 
@@ -195,7 +203,7 @@ def main():
             optimizer.step()
             total_loss += loss.item()
         
-        scheduler.step()
+        # REMOVED scheduler.step()
         
         if rank == 0:
             avg_loss = total_loss / len(train_loader)
