@@ -20,6 +20,7 @@ class MobileCLIPRanker(nn.Module):
             param.requires_grad = False
 
         self.projector = nn.Sequential(
+            nn.Dropout(cfg.model.dropout), 
             nn.Linear(self.backbone_dim, self.backbone_dim),
             nn.LayerNorm(self.backbone_dim),
             nn.GELU()
@@ -50,15 +51,13 @@ class MobileCLIPRanker(nn.Module):
         x_flat = x.view(b * g, c, h, w)
         
         with torch.no_grad():
-            features = self.backbone(x_flat) # [B*G, 512]
+            features = self.backbone(x_flat) 
             
-        features = features.view(b, g, -1) # [B, G, 512]
+        features = features.view(b, g, -1)
         
         if valid_lens is not None:
-            # Create mask: [B, G, 1]
             mask = torch.arange(g, device=x.device).expand(b, g) < valid_lens.unsqueeze(1)
             mask = mask.unsqueeze(-1).float()
-            
             sum_features = (features * mask).sum(dim=1, keepdim=True)
             mean_features = sum_features / (valid_lens.view(b, 1, 1) + 1e-6)
         else:
@@ -66,7 +65,7 @@ class MobileCLIPRanker(nn.Module):
             
         centered_features = features - mean_features 
         
-        projected = self.projector(centered_features) # [B, G, 512]
+        projected = self.projector(centered_features)
         
         projected_norm = F.normalize(projected, p=2, dim=2)
         ideal_norm = F.normalize(self.ideal_vector, p=2, dim=2)
