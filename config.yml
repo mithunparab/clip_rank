@@ -17,8 +17,9 @@ model:
   dropout: 0.2
 
 train:
-  batch_size: 1
-  lr_head: 0.001  
+  batch_size: 4       
+  lr_head: 0.0001
+  lr_backbone: 0.000001 
   epochs: 30
   weight_decay: 0.01
   grad_clip: 1.0
