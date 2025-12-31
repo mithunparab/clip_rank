@@ -28,35 +28,33 @@ def setup_ddp():
 def cleanup_ddp():
     if dist.is_initialized(): dist.destroy_process_group()
 
-def ranknet_loss(pred_scores, gt_scores, valid_len):
-    total_loss = 0.0
+def dynamic_margin_loss(pred_scores, gt_scores, valid_len):
+    device = pred_scores.device
+    loss = 0.0
     n_pairs = 0
-    bce = nn.BCEWithLogitsLoss(reduction='none')
     
     for b in range(pred_scores.shape[0]):
         n_imgs = int(valid_len[b].item())
-        if n_imgs < 2: continue
-
-        p_scores = pred_scores[b, :n_imgs].view(-1)
+        p_scores = pred_scores[b, :n_imgs]
         g_scores = gt_scores[b, :n_imgs]
         
-        p_diff = p_scores.unsqueeze(0) - p_scores.unsqueeze(1)
-        g_diff = g_scores.unsqueeze(0) - g_scores.unsqueeze(1)
+        p_diff_mat = p_scores.unsqueeze(0) - p_scores.unsqueeze(1)
+        g_diff_mat = g_scores.unsqueeze(0) - g_scores.unsqueeze(1)
         
-        pair_mask = g_diff > 0
+        pair_mask = g_diff_mat > 0
         if pair_mask.sum() == 0: continue
             
-        pred_diffs = p_diff[pair_mask]
-        targets = torch.ones_like(pred_diffs)
+        dynamic_margins = g_diff_mat[pair_mask] * 0.1 
+        preds = p_diff_mat[pair_mask]
         
-        weights = torch.log1p(g_diff[pair_mask])
+        pair_losses = torch.relu(dynamic_margins - preds)
         
-        loss = bce(pred_diffs, targets) * weights
-        total_loss += loss.mean()
+        # Accumulate loss
+        loss = loss + pair_losses.mean()
         n_pairs += 1
         
     if n_pairs > 0:
-        return total_loss / n_pairs
+        return loss / n_pairs
     else:
         return pred_scores.sum() * 0.0
 
@@ -75,9 +73,6 @@ def validate(model, df_val, cfg, device):
     strict_wins = 0
     relaxed_wins = 0
     total_groups = 0
-    
-    # Debug print
-    debug_printed = False
     
     with torch.no_grad():
         for _, group in grouped:
@@ -99,10 +94,6 @@ def validate(model, df_val, cfg, device):
             
             pred_scores = model(batch, valid_lens=valid_len).view(-1).cpu().numpy()
             
-            if not debug_printed:
-                print(f"\n[DEBUG] Sample Preds: {pred_scores[:5]} | GT: {gt_scores[:5]}")
-                debug_printed = True
-            
             best_pred_idx = np.argmax(pred_scores)
             score_of_model_choice = gt_scores[best_pred_idx]
             max_gt_score = max(gt_scores)
@@ -120,6 +111,7 @@ def save_checkpoint(model, optimizer, epoch, path, is_best=False):
         'model_state_dict': model.module.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
     }
+    # Save last.pth to save space
     torch.save(checkpoint, path)
     if is_best:
         best_path = os.path.join(os.path.dirname(path), "best_model.pth")
@@ -132,6 +124,8 @@ def main():
 
     rank, local_rank = setup_ddp()
     cfg = load_config("config.yml")
+    
+    os.makedirs(cfg.train.save_dir, exist_ok=True)
     
     torch.manual_seed(cfg.train.seed)
     np.random.seed(cfg.train.seed)
@@ -157,26 +151,12 @@ def main():
     if dist.is_initialized():
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
     
-    backbone_params = []
-    head_params = []
+    trainable_params = filter(lambda p: p.requires_grad, model.parameters())
     
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if "backbone" in name or "image_encoder" in name:
-            backbone_params.append(param)
-        else:
-            head_params.append(param)
-
-    optimizer = optim.AdamW([
-        {'params': backbone_params, 'lr': cfg.train.lr_backbone},
-        {'params': head_params, 'lr': cfg.train.lr_head}
-    ], weight_decay=cfg.train.weight_decay)
-    
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.train.epochs, eta_min=1e-6)
+    optimizer = optim.AdamW(trainable_params, lr=cfg.train.lr_head, weight_decay=cfg.train.weight_decay)
     
     start_epoch = 0
-    best_score = 0.0 
+    best_score = 0.0
 
     if args.resume and os.path.isfile(args.resume):
         if rank == 0: print(f"--> Loading checkpoint: {args.resume}")
@@ -187,7 +167,7 @@ def main():
             start_epoch = checkpoint['epoch']
             if rank == 0: print(f"--> Resuming from Epoch {start_epoch}")
         except:
-             if rank == 0: print("--> Checkpoint structure mismatch, starting fresh.")
+             if rank == 0: print("--> Checkpoint mismatch, starting fresh.")
             
     if rank == 0:
         print(f"Training Directional Ranker on {len(train_ds)} properties ({(1 - 1/cfg.data.n_splits):.0%} Split).")
@@ -205,14 +185,12 @@ def main():
             optimizer.zero_grad()
             pred_scores = model(img_stack, valid_lens=valid_len)
             
-            loss = ranknet_loss(pred_scores, score_stack, valid_len)
+            loss = dynamic_margin_loss(pred_scores, score_stack, valid_len)
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
             optimizer.step()
             total_loss += loss.item()
-        
-        scheduler.step()
         
         if rank == 0:
             avg_loss = total_loss / len(train_loader)
@@ -223,11 +201,9 @@ def main():
             if is_best:
                 best_score = current_score
             
-            print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Strict: {strict:.2%} | Relaxed: {relaxed:.2%} | Best (Combined): {current_score:.2f}")
+            print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Strict: {strict:.2%} | Relaxed: {relaxed:.2%} | Best: {best_score:.2%}")
             
-            os.makedirs(cfg.train.save_dir, exist_ok=True)
-            save_path = f"{cfg.train.save_dir}/epoch_{epoch+1}.pth"
-            
+            save_path = f"{cfg.train.save_dir}/last.pth"
             save_checkpoint(model, optimizer, epoch + 1, save_path, is_best=is_best)
 
     cleanup_ddp()
