@@ -9,28 +9,6 @@ data:
   img_size: 336
   max_images_per_group: 15
   val_fold: 0
-  n_splits: 6  
-
-model:
-  name: "mobileclip_b"
-  head_hidden_dim: 512
-  dropout: 0.2
-
-train:
-  batch_size: 1================================================
-FILE: config.yml
-================================================
-system:
-  device: "cuda"
-  num_workers: 4
-  pin_memory: true
-
-data:
-  csv_path: "dataset.csv"
-  images_dir: "images"
-  img_size: 336
-  max_images_per_group: 15
-  val_fold: 0
   n_splits: 6 
 
 model:
