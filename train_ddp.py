@@ -1,5 +1,4 @@
 import os
-import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -8,10 +7,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import pandas as pd
-import numpy as np
-from sklearn.model_selection import GroupKFold
-from tqdm import tqdm
-from torchvision import transforms 
+from tqdm import tqdm 
 from dataset import PropertyPreferenceDataset
 from model import MobileCLIPRanker
 from utils import load_config 
@@ -28,53 +24,64 @@ def setup_ddp():
 def cleanup_ddp():
     if dist.is_initialized(): dist.destroy_process_group()
 
-def listwise_softmax_loss(pred_scores, gt_scores, valid_len):
+def ordinal_margin_loss(pred_scores, gt_scores, valid_len):
     """
-    Listwise Softmax (Cross Entropy).
-    Given scores [s1, s2, s3], Softmax makes them sum to 1.
-    We maximize the log-likelihood of the Winner's index.
-    
-    This preserves hierarchy:
-    - If Winner is present, it must be max.
-    - If Winner is missing, the next best (Bedroom) becomes the new max in the math.
+    Enforces the Caste System: Tier 2 >> Tier 1 >> Tier 0.
+    1. Convert raw scores to Tiers (0, 1, 2).
+    2. Penalize if Higher Tier Score < Lower Tier Score + Margin.
     """
     loss = 0.0
-    valid_batches = 0
-    ce_loss = nn.CrossEntropyLoss()
+    n_pairs = 0
+    
+    # Define Tiers based on your logic
+    # Tier 2: 8-10 (Gold)
+    # Tier 1: 3-5 (Silver)
+    # Tier 0: 0-2 (Trash)
+    tiers = torch.zeros_like(gt_scores)
+    tiers[gt_scores >= 8] = 2.0
+    tiers[(gt_scores >= 3) & (gt_scores < 8)] = 1.0
     
     for b in range(pred_scores.shape[0]):
-        n_imgs = int(valid_len[b].item())
-        if n_imgs < 2: continue
+        n = int(valid_len[b].item())
+        if n < 2: continue
+        
+        p = pred_scores[b, :n].view(-1)
+        t = tiers[b, :n]
+        
+        # Broadcast differences
+        tier_diff = t.unsqueeze(0) - t.unsqueeze(1)
+        
+        # Find pairs where i is a higher tier than j
+        pairs = torch.nonzero(tier_diff > 0)
+        
+        if len(pairs) == 0: continue
             
-        logits = pred_scores[b, :n_imgs].view(1, -1)
-        gts = gt_scores[b, :n_imgs]
-        
-        target_idx = torch.argmax(gts).unsqueeze(0)
-        
-        batch_loss = ce_loss(logits, target_idx)
-        
-        loss = loss + batch_loss
-        valid_batches += 1
-        
-    if valid_batches > 0:
-        return loss / valid_batches
-    else:
-        return pred_scores.sum() * 0.0
+        for idx in pairs:
+            i, j = idx[0], idx[1]
+            
+            # Dynamic Margin based on Tier Distance
+            # Gap of 1 tier (2 vs 1, or 1 vs 0) -> Margin 1.0
+            # Gap of 2 tiers (2 vs 0)          -> Margin 2.5
+            dist = tier_diff[i, j].item()
+            margin = 1.0 if dist == 1.0 else 2.5
+            
+            # We want: Score_i > Score_j + Margin
+            # Loss = ReLU(Margin - (Score_i - Score_j))
+            current_gap = p[i] - p[j]
+            loss += torch.relu(margin - current_gap)
+            n_pairs += 1
+            
+    if n_pairs > 0:
+        return loss / n_pairs
+    return torch.tensor(0.0, device=pred_scores.device, requires_grad=True)
 
 def validate(model, df_val, cfg, device):
     model.eval()
-    ds_helper = PropertyPreferenceDataset(
-        pd.DataFrame({'group_id':[], 'score':[]}), 
-        images_dir="images", is_train=False, img_size=cfg.data.img_size
-    )
-    
-    if 'file_path' not in df_val.columns:
-         df_val = df_val.copy()
-         df_val['file_path'] = df_val.index.map(lambda x: f"images/{x}.jpg")
+    ds = PropertyPreferenceDataset(pd.DataFrame({'group_id':[], 'score':[]}), images_dir="images", is_train=False, img_size=cfg.data.img_size)
+    if 'file_path' not in df_val.columns: df_val['file_path'] = df_val.index.map(lambda x: f"images/{x}.jpg")
     
     grouped = df_val.groupby('group_id')
     strict_wins = 0
-    relaxed_wins = 0
     total_groups = 0
     
     debug_printed = False
@@ -82,136 +89,90 @@ def validate(model, df_val, cfg, device):
     with torch.no_grad():
         for _, group in grouped:
             if len(group) < 2: continue
-            
-            images, gt_scores = [], []
+            images, scores = [], []
             for _, row in group.iterrows():
-                path = row['file_path']
-                if not os.path.exists(path): continue
-                img = ds_helper._letterbox_image(path)
-                t_img = ds_helper.normalize(transforms.functional.to_tensor(img))
-                images.append(t_img)
-                gt_scores.append(row['score'])
-                
+                if not os.path.exists(row['file_path']): continue
+                images.append(ds._process(row['file_path']))
+                scores.append(row['score'])
+            
             if len(images) < 2: continue
-            
             batch = torch.stack(images).unsqueeze(0).to(device)
-            valid_len = torch.tensor([len(images)]).to(device)
             
-            pred_scores = model(batch, valid_lens=valid_len).view(-1).cpu().numpy()
+            preds = model(batch, valid_lens=torch.tensor([len(images)])).view(-1).cpu().numpy()
             
-            if not debug_printed:
-                print(f"\n[DEBUG] Raw Scores: {pred_scores[:5].flatten()} | GT: {gt_scores[:5]}")
-                debug_printed = True
-
-            best_pred_idx = np.argmax(pred_scores)
-            score_of_model_choice = gt_scores[best_pred_idx]
-            max_gt_score = max(gt_scores)
+            # Validation Metric: Did we pick a Tier 2 image?
+            best_idx = preds.argmax()
+            best_score = scores[best_idx]
             
-            if score_of_model_choice == max_gt_score: strict_wins += 1
-            if score_of_model_choice >= (max_gt_score - 1.0): relaxed_wins += 1
+            # Ideally we want a Tier 2 (>=8). If none exist, we want Tier 1 (>=3).
+            max_possible = max(scores)
+            
+            # Simple Strict Accuracy: Did we pick the highest available tier?
+            if best_score >= 8:
+                strict_wins += 1 # We picked a Gold image
+            elif max_possible < 8 and best_score >= 3:
+                strict_wins += 1 # No Gold existed, so we picked Silver. Good job.
+            elif max_possible < 3:
+                strict_wins += 1 # Only trash existed, we picked trash. Fine.
+                
             total_groups += 1
             
-    if total_groups == 0: return 0.0, 0.0
-    return strict_wins / total_groups, relaxed_wins / total_groups
+            if not debug_printed:
+                print(f"[DEBUG] Preds: {preds[:5]} | GT: {scores[:5]}")
+                debug_printed = True
+                
+    return strict_wins / total_groups if total_groups > 0 else 0.0
 
-def save_checkpoint(model, optimizer, epoch, path, is_best=False):
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.module.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-    }
-    torch.save(checkpoint, path)
-    if is_best:
-        best_path = os.path.join(os.path.dirname(path), "best_model.pth")
-        torch.save(checkpoint, best_path)
+def save_checkpoint(model, optimizer, epoch, path):
+    raw_model = model.module if hasattr(model, "module") else model
+    torch.save({'state_dict': raw_model.state_dict()}, path)
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--resume', type=str, default=None)
     args = parser.parse_args()
-
     rank, local_rank = setup_ddp()
     cfg = load_config("config.yml")
     
-    best_score = 0.0
     os.makedirs(cfg.train.save_dir, exist_ok=True)
-    
-    torch.manual_seed(cfg.train.seed)
-    np.random.seed(cfg.train.seed)
+    torch.manual_seed(42)
     
     df = pd.read_csv(cfg.data.csv_path)
-    gkf = GroupKFold(n_splits=cfg.data.n_splits)
-    train_idx, val_idx = next(gkf.split(df, groups=df['group_id']))
-    train_df = df.iloc[train_idx]
-    val_df = df.iloc[val_idx]
+    # Simple split
+    val_groups = df['group_id'].unique()[:int(len(df['group_id'].unique()) * 0.1)]
+    train_df = df[~df['group_id'].isin(val_groups)]
+    val_df = df[df['group_id'].isin(val_groups)]
     
-    train_ds = PropertyPreferenceDataset(train_df, images_dir="images", is_train=True, img_size=cfg.data.img_size, max_len=cfg.data.max_images_per_group)
+    train_ds = PropertyPreferenceDataset(train_df, images_dir="images", is_train=True, img_size=cfg.data.img_size)
     sampler = DistributedSampler(train_ds, shuffle=True) if dist.is_initialized() else None
     
-    train_loader = DataLoader(
-        train_ds, batch_size=cfg.train.batch_size, sampler=sampler, 
-        num_workers=cfg.system.num_workers, pin_memory=cfg.system.pin_memory, 
-        shuffle=(sampler is None), drop_last=True
-    )
+    train_loader = DataLoader(train_ds, batch_size=1, sampler=sampler, num_workers=4, pin_memory=True)
     
     device = torch.device(f"cuda:{local_rank}")
     model = MobileCLIPRanker(cfg).to(device)
+    if dist.is_initialized(): model = DDP(model, device_ids=[local_rank])
     
-    if dist.is_initialized():
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+    optimizer = optim.AdamW(model.parameters(), lr=cfg.train.lr_head, weight_decay=0.01)
     
-    trainable_params = filter(lambda p: p.requires_grad, model.parameters())
-    optimizer = optim.AdamW(trainable_params, lr=cfg.train.lr_head, weight_decay=cfg.train.weight_decay)
-    
-    start_epoch = 0
-
-    if args.resume and os.path.isfile(args.resume):
-        if rank == 0: print(f"--> Loading checkpoint: {args.resume}")
-        checkpoint = torch.load(args.resume, map_location=device)
-        try:
-            model.module.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            start_epoch = checkpoint['epoch']
-            if rank == 0: print(f"--> Resuming from Epoch {start_epoch}")
-        except:
-             if rank == 0: print("--> Checkpoint mismatch, starting fresh.")
-            
-    if rank == 0:
-        print(f"Training Directional Ranker on {len(train_ds)} properties ({(1 - 1/cfg.data.n_splits):.0%} Split).")
-
-    for epoch in range(start_epoch, cfg.train.epochs):
-        if dist.is_initialized(): sampler.set_epoch(epoch)
+    for epoch in range(cfg.train.epochs):
         model.train()
         total_loss = 0.0
         
         iterator = tqdm(train_loader, desc=f"Epoch {epoch+1}") if rank == 0 else train_loader
         
-        for img_stack, score_stack, valid_len in iterator:
-            img_stack, score_stack, valid_len = img_stack.to(device), score_stack.to(device), valid_len.to(device)
-            
+        for imgs, scores, vlen in iterator:
+            imgs, scores = imgs.to(device), scores.to(device)
             optimizer.zero_grad()
-            pred_scores = model(img_stack, valid_lens=valid_len)
-            
-            loss = listwise_softmax_loss(pred_scores, score_stack, valid_len)
-            
+            preds = model(imgs, vlen)
+            loss = ordinal_margin_loss(preds, scores, vlen)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
             optimizer.step()
             total_loss += loss.item()
-        
+            
         if rank == 0:
-            avg_loss = total_loss / len(train_loader)
-            strict, relaxed = validate(model.module, val_df, cfg, device)
-            
-            current_score = strict + relaxed
-            is_best = current_score > best_score
-            if is_best:
-                best_score = current_score
-            
-            print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Strict: {strict:.2%} | Relaxed: {relaxed:.2%} | Best: {best_score:.2%}")
-            
-            save_path = f"{cfg.train.save_dir}/last.pth"
-            save_checkpoint(model, optimizer, epoch + 1, save_path, is_best=is_best)
+            acc = validate(model.module if hasattr(model, 'module') else model, val_df, cfg, device)
+            print(f"Epoch {epoch+1} | Loss: {total_loss/len(train_loader):.4f} | Accuracy: {acc:.2%}")
+            save_checkpoint(model, optimizer, epoch, f"{cfg.train.save_dir}/last.pth")
 
     cleanup_ddp()
 
