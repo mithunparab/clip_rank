@@ -15,21 +15,17 @@ class MobileCLIPRanker(nn.Module):
         print(f"Loading {filename}...")
         model, _, _ = mobileclip.create_model_and_transforms(cfg.model.name, pretrained=ckpt)
         self.backbone = model.image_encoder
-        self.backbone_dim = 512
+        self.backbone_dim = 512 
         
-        # FREEZE BACKBONE COMPLETELY
-        # We trust CLIP's internal separation of "Living Room" vs "Toilet"
         self.backbone.eval()
         for param in self.backbone.parameters():
             param.requires_grad = False
             
-        # Simple Linear Head
-        # No sigmoid, no normalization. Just raw score prediction.
         self.head = nn.Linear(self.backbone_dim, 1)
         
     def train(self, mode=True):
         super().train(mode)
-        self.backbone.eval() # Keep stats frozen
+        self.backbone.eval() 
         return self
 
     def forward(self, x, valid_lens=None):

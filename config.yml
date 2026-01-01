@@ -6,7 +6,7 @@ system:
 data:
   csv_path: "dataset.csv"
   images_dir: "images"
-  img_size: 224 # Native B size is 224 or 336 depending on checkpoint, sticking to 224 is safer for speed
+  img_size: 224
   
 model:
   name: "mobileclip_b"
@@ -14,5 +14,8 @@ model:
 train:
   batch_size: 1
   lr_head: 0.001
-  epochs: 20      # Converges fast with frozen backbone
+  epochs: 20
+  weight_decay: 0.01
+  grad_clip: 1.0
+  seed: 42
   save_dir: "checkpoints"

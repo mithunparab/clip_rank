@@ -9,12 +9,10 @@ class PropertyPreferenceDataset(Dataset):
         self.img_size = img_size
         self.df = df.copy()
         
-        # Filter valid
         if 'file_path' not in self.df.columns:
             self.df['file_path'] = self.df.index.map(lambda x: os.path.join(images_dir, f"{x}.jpg"))
         self.df = self.df[self.df['file_path'].apply(os.path.exists)]
 
-        # Standard CLIP Transform
         self.process = transforms.Compose([
             transforms.Resize(self.img_size, interpolation=transforms.InterpolationMode.BICUBIC),
             transforms.CenterCrop(self.img_size),
@@ -40,12 +38,11 @@ class PropertyPreferenceDataset(Dataset):
 
     def __getitem__(self, idx):
         records = self.groups[idx]
-        selected = records[:15] # Max 15
+        selected = records[:15] 
         
         tensors = [self._process(r['file_path']) for r in selected]
         scores = [float(r['score']) for r in selected]
         
-        # Pad
         pad = 15 - len(tensors)
         if pad > 0:
             tensors += [torch.zeros(3, self.img_size, self.img_size)] * pad
