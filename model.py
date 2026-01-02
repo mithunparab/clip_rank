@@ -25,13 +25,13 @@ class MobileCLIPRanker(nn.Module):
             
         else:
             if "s3" in cfg.model.name.lower():
-                repo_id = "apple/MobileCLIP-S3"
-                filename = "mobileclip_s3.pt"
-                arch = "mobileclip_s3"
+                repo_id = "apple/MobileCLIP2-S3"
+                filename = "mobileclip2_s3.pt"
+                arch = "mobileclip2_s3"
             elif "s0" in cfg.model.name.lower():
-                repo_id = "apple/MobileCLIP-S0"
-                filename = "mobileclip_s0.pt"
-                arch = "mobileclip_s0"
+                repo_id = "apple/MobileCLIP2-S0"
+                filename = "mobileclip2_s0.pt"
+                arch = "mobileclip2_s0"
             else:
                 repo_id = "apple/MobileCLIP2-B"
                 filename = "mobileclip2_b.pt"
