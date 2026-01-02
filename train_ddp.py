@@ -28,12 +28,8 @@ def cleanup_ddp():
 
 def ordinal_margin_loss(pred_scores, gt_scores, valid_len):
     """
-    Tier 2 (8-10): Gold (LR/Open)
-    Tier 1 (3-5): Silver (Bedroom)
-    Tier 0 (0-2): Trash (Bath/Other)
-    
-    We only punish: High Tier < Low Tier + Margin.
-    We DO NOT punish: High Tier vs High Tier (Multiple 10s are fine).
+    Enforces Tier 2 (8-10) > Tier 1 (3-5) > Tier 0 (0-2).
+    Ignores comparisons within the same tier (e.g. 10 vs 10).
     """
     loss = 0.0
     n_pairs = 0
@@ -62,7 +58,6 @@ def ordinal_margin_loss(pred_scores, gt_scores, valid_len):
             margin = 1.0 if dist_val == 1.0 else 2.5
             
             current_gap = p[i] - p[j]
-            
             loss += torch.relu(margin - current_gap)
             n_pairs += 1
             
@@ -92,7 +87,7 @@ def validate(model, df_val, cfg, device):
                 images.append(ds._process(row['file_path']))
                 
                 raw = float(row['score'])
-                lbl = row.get('label', '').lower()
+                lbl = str(row.get('label', '')).lower()
                 if raw >= 8 and lbl in ['outdoor','bathroom','other','balcony']: raw = 0.0
                 if raw >= 8 and lbl == 'bedroom': raw = 3.0
                 scores.append(raw)
@@ -107,7 +102,6 @@ def validate(model, df_val, cfg, device):
             best_score = scores[best_idx]
             max_possible = max(scores)
             
-
             picked_tier = 2 if best_score >=8 else (1 if best_score >=3 else 0)
             max_tier = 2 if max_possible >=8 else (1 if max_possible >=3 else 0)
             
@@ -138,10 +132,11 @@ def main():
     rank, local_rank = setup_ddp()
     cfg = load_config("config.yml")
     
-    os.makedirs(cfg.train.save_dir, exist_ok=True)
+    seed = getattr(cfg.train, 'seed', 42)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
     
-    torch.manual_seed(cfg.train.seed)
-    np.random.seed(cfg.train.seed)
+    os.makedirs(cfg.train.save_dir, exist_ok=True)
     
     df = pd.read_csv(cfg.data.csv_path)
     
@@ -161,25 +156,16 @@ def main():
     device = torch.device(f"cuda:{local_rank}")
     model = MobileCLIPRanker(cfg).to(device)
     
-    if dist.is_initialized(): model = DDP(model, device_ids=[local_rank])
+    if dist.is_initialized(): 
+        model = DDP(model, device_ids=[local_rank])
     
-    raw_model = model.module if hasattr(model, "module") else model
-    backbone_params = []
-    head_params = []
-    for name, param in raw_model.named_parameters():
-        if not param.requires_grad: continue
-        if "head" in name:
-            head_params.append(param)
-        else:
-            backbone_params.append(param)
-
-    optimizer = optim.AdamW([
-        {'params': backbone_params, 'lr': cfg.train.lr_backbone},
-        {'params': head_params, 'lr': cfg.train.lr_head}
-    ], weight_decay=cfg.train.weight_decay)
+    optimizer = optim.AdamW(model.parameters(), lr=cfg.train.lr_head, weight_decay=cfg.train.weight_decay)
     
     best_acc = 0.0
     
+    if rank == 0:
+        print(f"Training on {len(train_ds)} groups (Ordinal Loss).")
+
     for epoch in range(cfg.train.epochs):
         model.train()
         total_loss = 0.0
@@ -202,8 +188,8 @@ def main():
         if rank == 0:
             avg_loss = total_loss / len(train_loader)
             
-            raw_model_val = model.module if hasattr(model, 'module') else model
-            acc = validate(raw_model_val, val_df, cfg, device)
+            raw_model = model.module if hasattr(model, 'module') else model
+            acc = validate(raw_model, val_df, cfg, device)
             
             print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Strict Accuracy: {acc:.2%}")
             
