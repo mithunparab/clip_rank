@@ -36,5 +36,4 @@ class MobileCLIPRanker(nn.Module):
             
         features = features.view(b, g, -1)
         scores = self.head(features)
-        
         return scores

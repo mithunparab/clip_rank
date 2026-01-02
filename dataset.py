@@ -13,7 +13,7 @@ class PropertyPreferenceDataset(Dataset):
         if 'file_path' not in self.df.columns:
             self.df['file_path'] = self.df.index.map(lambda x: os.path.join(images_dir, f"{x}.jpg"))
         self.df = self.df[self.df['file_path'].apply(os.path.exists)]
-
+ 
         self.process = transforms.Compose([
             transforms.Resize(self.img_size, interpolation=transforms.InterpolationMode.BICUBIC),
             transforms.CenterCrop(self.img_size),
