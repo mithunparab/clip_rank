@@ -1,9 +1,7 @@
-
 import os
 import argparse
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -28,53 +26,37 @@ def setup_ddp():
 def cleanup_ddp():
     if dist.is_initialized(): dist.destroy_process_group()
 
-def listwise_kl_loss(pred_scores, gt_scores, valid_len):
-    """
-    Treats ranking as a probability distribution alignment.
-    
-    1. GT Distribution: 
-       - Gold (Tier 2): High probability (shared if multiple).
-       - Silver (Tier 1): Low probability.
-       - Trash (Tier 0): Zero probability.
-       
-    2. Pred Distribution: Softmax(pred_scores).
-    
-    3. Loss: KL Divergence(GT || Pred).
-    
-    This forces the model to push Gold scores UP relative to everything else.
-    It correlates directly with Accuracy.
-    """
+def ordinal_margin_loss(pred_scores, gt_scores, valid_len):
     loss = 0.0
-    valid_batches = 0
+    n_pairs = 0
+    
+    tiers = torch.zeros_like(gt_scores)
+    tiers[gt_scores >= 8] = 2.0
+    tiers[(gt_scores >= 3) & (gt_scores < 8)] = 1.0
     
     for b in range(pred_scores.shape[0]):
         n = int(valid_len[b].item())
         if n < 2: continue
         
-        logits = pred_scores[b, :n].view(-1)
-        gts = gt_scores[b, :n]
+        p = pred_scores[b, :n].view(-1)
+        t = tiers[b, :n]
         
-        target_probs = torch.zeros_like(logits)
+        tier_diff = t.unsqueeze(0) - t.unsqueeze(1)
+        pairs = torch.nonzero(tier_diff > 0)
         
-        is_gold = gts >= 8
-        is_silver = (gts >= 3) & (gts < 8)
-        
-        if is_gold.sum() > 0:
-            target_probs[is_gold] = 1.0 / is_gold.sum()
-        elif is_silver.sum() > 0:
-            target_probs[is_silver] = 1.0 / is_silver.sum()
-        else:
-            target_probs.fill_(1.0 / n)
+        if len(pairs) == 0: continue
             
-        log_probs = F.log_softmax(logits, dim=0)
-        
-        batch_loss = -torch.sum(target_probs * log_probs)
-        
-        loss += batch_loss
-        valid_batches += 1
+        for idx in pairs:
+            i, j = idx[0], idx[1]
+            dist_val = tier_diff[i, j].item()
             
-    if valid_batches > 0:
-        return loss / valid_batches
+            margin = 1.0 if dist_val == 1.0 else 2.5
+            current_gap = p[i] - p[j]
+            loss += torch.relu(margin - current_gap)
+            n_pairs += 1
+            
+    if n_pairs > 0:
+        return loss / n_pairs
     return pred_scores.sum() * 0.0
 
 def validate(model, df_val, cfg, device):
@@ -83,9 +65,7 @@ def validate(model, df_val, cfg, device):
         pd.DataFrame({'group_id':[], 'score':[], 'label':[]}), 
         images_dir="images", is_train=False, img_size=cfg.data.img_size
     )
-    df_val = df_val.copy()
-    if 'file_path' not in df_val.columns: 
-        df_val['file_path'] = df_val.index.map(lambda x: f"images/{x}.jpg")
+    if 'file_path' not in df_val.columns: df_val['file_path'] = df_val.index.map(lambda x: f"images/{x}.jpg")
     
     grouped = df_val.groupby('group_id')
     strict_wins = 0
@@ -170,14 +150,17 @@ def main():
     device = torch.device(f"cuda:{local_rank}")
     model = MobileCLIPRanker(cfg).to(device)
     
-    if dist.is_initialized(): model = DDP(model, device_ids=[local_rank])
+    if dist.is_initialized(): 
+        model = DDP(model, device_ids=[local_rank])
     
     optimizer = optim.AdamW(model.parameters(), lr=cfg.train.lr_head, weight_decay=cfg.train.weight_decay)
     
     best_acc = 0.0
+    patience = 10
+    patience_counter = 0
     
     if rank == 0:
-        print(f"Training on {len(train_ds)} groups using Listwise KL Loss.")
+        print(f"Training on {len(train_ds)} groups.")
 
     for epoch in range(cfg.train.epochs):
         model.train()
@@ -191,7 +174,7 @@ def main():
             optimizer.zero_grad()
             preds = model(imgs, vlen)
             
-            loss = listwise_kl_loss(preds, scores, vlen)
+            loss = ordinal_margin_loss(preds, scores, vlen)
             loss.backward()
             
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
@@ -200,15 +183,23 @@ def main():
             
         if rank == 0:
             avg_loss = total_loss / len(train_loader)
+            
             raw_model = model.module if hasattr(model, 'module') else model
             acc = validate(raw_model, val_df, cfg, device)
             
             print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Strict Accuracy: {acc:.2%}")
             
-            is_best = acc > best_acc
-            if is_best: best_acc = acc
-            
-            save_checkpoint(model, optimizer, epoch + 1, f"{cfg.train.save_dir}/last.pth", is_best=is_best)
+            if acc > best_acc:
+                best_acc = acc
+                patience_counter = 0
+                save_checkpoint(model, optimizer, epoch + 1, f"{cfg.train.save_dir}/last.pth", is_best=True)
+            else:
+                patience_counter += 1
+                save_checkpoint(model, optimizer, epoch + 1, f"{cfg.train.save_dir}/last.pth", is_best=False)
+                
+            if patience_counter >= patience:
+                print(f"Early stopping triggered. No improvement for {patience} epochs.")
+                break
 
     cleanup_ddp()
 
