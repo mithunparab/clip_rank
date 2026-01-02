@@ -7,6 +7,7 @@ class MobileCLIPRanker(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         
+
         repo = "apple/MobileCLIP-B" if "b" in cfg.model.name else "apple/MobileCLIP-S0"
         filename = f"{cfg.model.name}.pt"
         ckpt = hf_hub_download(repo_id=repo, filename=filename)
@@ -20,20 +21,24 @@ class MobileCLIPRanker(nn.Module):
         for param in self.backbone.parameters():
             param.requires_grad = False
             
+        params_to_train = list(self.backbone.named_parameters())[-20:] 
+        print(f"Unfreezing {len(params_to_train)} backbone parameters...")
+        for name, param in params_to_train:
+            param.requires_grad = True
+            
         self.head = nn.Linear(self.backbone_dim, 1)
         
     def train(self, mode=True):
         super().train(mode)
-        self.backbone.eval()
+        self.backbone.eval() 
         return self
 
     def forward(self, x, valid_lens=None):
         b, g, c, h, w = x.shape
         x_flat = x.view(b * g, c, h, w)
         
-        with torch.no_grad():
-            features = self.backbone(x_flat) 
-            
+        features = self.backbone(x_flat) 
         features = features.view(b, g, -1)
         scores = self.head(features)
+        
         return scores
