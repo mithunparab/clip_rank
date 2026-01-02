@@ -47,21 +47,14 @@ class PropertyPreferenceDataset(Dataset):
         for r in selected:
             tensors.append(self._process(r['file_path']))
             
-            raw_score = float(r['score'])
-            label = str(r.get('label', '')).lower()
+            raw = float(r['score'])
+            lbl = str(r.get('label', '')).lower()
             
-
-            if raw_score >= 8:
-                if label in ['outdoor', 'bathroom', 'other', 'balcony']:
-                    final_score = 0.0 
-                elif label in ['bedroom']:
-                    final_score = 3.0 
-                else:
-                    final_score = raw_score
-            else:
-                final_score = raw_score
-                
-            scores.append(final_score)
+            if raw >= 8:
+                if lbl in ['outdoor','bathroom','other','balcony']: raw = 0.0
+                elif lbl == 'bedroom': raw = 3.0
+            
+            scores.append(raw)
         
         pad = 15 - len(tensors)
         if pad > 0:
