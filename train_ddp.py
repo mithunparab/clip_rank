@@ -28,11 +28,6 @@ def cleanup_ddp():
     if dist.is_initialized(): dist.destroy_process_group()
 
 def listwise_kl_loss(pred_scores, gt_scores, valid_len):
-    """
-    Listwise KL Divergence Loss.
-    Aligns the probability distribution of predictions with the GT hierarchy.
-    Handles multiple winners (two 10s) gracefully.
-    """
     loss = 0.0
     valid_batches = 0
     
@@ -156,13 +151,12 @@ def main():
     device = torch.device(f"cuda:{local_rank}")
     model = MobileCLIPRanker(cfg).to(device)
     
-    if dist.is_initialized(): model = DDP(model, device_ids=[local_rank])
+    if dist.is_initialized(): 
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
     
-    # --- DIFFERENTIAL LEARNING RATE OPTIMIZER ---
     raw_model = model.module if hasattr(model, "module") else model
     backbone_params = []
     head_params = []
-    
     for name, param in raw_model.named_parameters():
         if not param.requires_grad: continue
         if "head" in name:
@@ -178,11 +172,11 @@ def main():
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.train.epochs, eta_min=1e-6)
     
     best_acc = 0.0
-    patience = 10
+    patience = 15
     patience_counter = 0
     
     if rank == 0:
-        print(f"Training on {len(train_ds)} groups (Listwise KL + Unfrozen).")
+        print(f"Training on {len(train_ds)} groups.")
 
     for epoch in range(cfg.train.epochs):
         model.train()

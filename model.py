@@ -3,7 +3,6 @@ import torch.nn as nn
 import mobileclip
 import open_clip
 from huggingface_hub import hf_hub_download
-from mobileclip.modules.common.mobileone import reparameterize_model
 
 class MobileCLIPRanker(nn.Module):
     def __init__(self, cfg):
@@ -21,10 +20,6 @@ class MobileCLIPRanker(nn.Module):
                 'MobileCLIP2-L-14', 
                 pretrained=ckpt_path
             )
-            
-            model.eval()
-            model = reparameterize_model(model)
-            
             self.backbone = model.visual
             self.backbone_dim = 768
             

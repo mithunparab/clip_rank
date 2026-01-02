@@ -2,6 +2,7 @@ import torch
 import requests
 import yaml
 import os
+import time
 import glob
 from PIL import Image
 from io import BytesIO
@@ -131,7 +132,12 @@ if __name__ == "__main__":
         "https://ap.rdcpix.com/c3065cb0efd74e0e69c634c4e7926ed0l-m3456441259s-w2048_h1536.jpg"
     ]
     
+    start_time = time.time()
+    
     results = ranker.rank(test_urls)
+    
+    end_time = time.time()
+    elapsed = end_time - start_time
     
     print("\n" + "="*50)
     print(f"RANKING RESULTS")
@@ -139,3 +145,7 @@ if __name__ == "__main__":
     
     for i, res in enumerate(results):
         print(f"{i+1}. Score: {res['score']:.4f} | {res['source']}")
+        
+    print("="*50)
+    print(f"Total Time Taken: {elapsed:.4f} seconds")
+    print("="*50)
