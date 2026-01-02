@@ -139,11 +139,9 @@ def main():
     device = torch.device(f"cuda:{local_rank}")
     model = MobileCLIPRanker(cfg).to(device)
     
-    if dist.is_initialized(): 
-        model = DDP(model, device_ids=[local_rank])
+    if dist.is_initialized(): model = DDP(model, device_ids=[local_rank])
     
     raw_model = model.module if hasattr(model, "module") else model
-    
     backbone_params = []
     head_params = []
     for name, param in raw_model.named_parameters():
@@ -158,12 +156,14 @@ def main():
         {'params': head_params, 'lr': cfg.train.lr_head}
     ], weight_decay=cfg.train.weight_decay)
     
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.train.epochs, eta_min=1e-6)
+    
     best_acc = 0.0
     patience = 10
     patience_counter = 0
     
     if rank == 0:
-        print(f"Training on {len(train_ds)} groups (Listwise Softmax).")
+        print(f"Training on {len(train_ds)} groups (Listwise Softmax + Unfrozen).")
 
     for epoch in range(cfg.train.epochs):
         model.train()
@@ -176,8 +176,6 @@ def main():
             
             optimizer.zero_grad()
             preds = model(imgs, vlen)
-            
-            # THE FIX: Using Listwise Softmax
             loss = listwise_softmax_loss(preds, scores, vlen)
             loss.backward()
             
@@ -185,10 +183,12 @@ def main():
             optimizer.step()
             total_loss += loss.item()
             
+        scheduler.step()
+        
         if rank == 0:
             avg_loss = total_loss / len(train_loader)
-            raw_val_model = model.module if hasattr(model, 'module') else model
-            acc = validate(raw_val_model, val_df, cfg, device)
+            raw_val = model.module if hasattr(model, 'module') else model
+            acc = validate(raw_val, val_df, cfg, device)
             
             print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Strict Accuracy: {acc:.2%}")
             
@@ -201,7 +201,7 @@ def main():
                 save_checkpoint(model, optimizer, epoch + 1, f"{cfg.train.save_dir}/last.pth", is_best=False)
                 
             if patience_counter >= patience:
-                print(f"Early stopping triggered. Best Accuracy: {best_acc:.2%}")
+                print(f"Early stopping. Best: {best_acc:.2%}")
                 break
 
     cleanup_ddp()
