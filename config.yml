@@ -13,9 +13,9 @@ model:
 
 train:
   batch_size: 1
-  lr_head: 0.001
-  epochs: 20
+  lr_head: 0.001          
+  lr_backbone: 0.00001    
+  epochs: 30
   weight_decay: 0.01
   grad_clip: 1.0
-  seed: 42
   save_dir: "checkpoints"
