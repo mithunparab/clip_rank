@@ -15,12 +15,12 @@ class MobileCLIPRanker(nn.Module):
         model, _, _ = mobileclip.create_model_and_transforms(cfg.model.name, pretrained=ckpt)
         self.backbone = model.image_encoder
         self.backbone_dim = 512 
-        
+
         self.backbone.eval()
         for param in self.backbone.parameters():
             param.requires_grad = False
             
-        params_to_train = list(self.backbone.named_parameters())[-30:] 
+        params_to_train = list(self.backbone.named_parameters())[-20:] 
         print(f"Unfreezing {len(params_to_train)} parameters...")
         for name, param in params_to_train:
             param.requires_grad = True
@@ -29,7 +29,7 @@ class MobileCLIPRanker(nn.Module):
         
     def train(self, mode=True):
         super().train(mode)
-        self.backbone.eval()
+        self.backbone.eval() 
         return self
 
     def forward(self, x, valid_lens=None):
