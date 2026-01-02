@@ -20,7 +20,6 @@ class MobileCLIPRanker(nn.Module):
         for param in self.backbone.parameters():
             param.requires_grad = False
             
-        # Linear Head
         self.head = nn.Linear(self.backbone_dim, 1)
         
     def train(self, mode=True):
@@ -37,4 +36,5 @@ class MobileCLIPRanker(nn.Module):
             
         features = features.view(b, g, -1)
         scores = self.head(features)
+        
         return scores
