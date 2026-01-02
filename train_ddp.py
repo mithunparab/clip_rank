@@ -28,9 +28,12 @@ def cleanup_ddp():
 
 def ordinal_margin_loss(pred_scores, gt_scores, valid_len):
     """
-    Enforces the Caste System: Tier 2 >> Tier 1 >> Tier 0.
-    1. Convert raw scores to Tiers (0, 1, 2).
-    2. Penalize if Higher Tier Score < Lower Tier Score + Margin.
+    Tier 2 (8-10): Gold (LR/Open)
+    Tier 1 (3-5): Silver (Bedroom)
+    Tier 0 (0-2): Trash (Bath/Other)
+    
+    We only punish: High Tier < Low Tier + Margin.
+    We DO NOT punish: High Tier vs High Tier (Multiple 10s are fine).
     """
     loss = 0.0
     n_pairs = 0
@@ -54,10 +57,12 @@ def ordinal_margin_loss(pred_scores, gt_scores, valid_len):
             
         for idx in pairs:
             i, j = idx[0], idx[1]
-            
             dist_val = tier_diff[i, j].item()
+            
             margin = 1.0 if dist_val == 1.0 else 2.5
+            
             current_gap = p[i] - p[j]
+            
             loss += torch.relu(margin - current_gap)
             n_pairs += 1
             
@@ -68,19 +73,14 @@ def ordinal_margin_loss(pred_scores, gt_scores, valid_len):
 def validate(model, df_val, cfg, device):
     model.eval()
     ds = PropertyPreferenceDataset(
-        pd.DataFrame({'group_id':[], 'score':[]}), 
+        pd.DataFrame({'group_id':[], 'score':[], 'label':[]}), 
         images_dir="images", is_train=False, img_size=cfg.data.img_size
     )
-    
-    if 'file_path' not in df_val.columns:
-         df_val = df_val.copy()
-         df_val['file_path'] = df_val.index.map(lambda x: f"images/{x}.jpg")
+    if 'file_path' not in df_val.columns: df_val['file_path'] = df_val.index.map(lambda x: f"images/{x}.jpg")
     
     grouped = df_val.groupby('group_id')
     strict_wins = 0
     total_groups = 0
-    
-    debug_printed = False
     
     with torch.no_grad():
         for _, group in grouped:
@@ -90,10 +90,14 @@ def validate(model, df_val, cfg, device):
             for _, row in group.iterrows():
                 if not os.path.exists(row['file_path']): continue
                 images.append(ds._process(row['file_path']))
-                scores.append(row['score'])
+                
+                raw = float(row['score'])
+                lbl = row.get('label', '').lower()
+                if raw >= 8 and lbl in ['outdoor','bathroom','other','balcony']: raw = 0.0
+                if raw >= 8 and lbl == 'bedroom': raw = 3.0
+                scores.append(raw)
             
             if len(images) < 2: continue
-            
             batch = torch.stack(images).unsqueeze(0).to(device)
             valid_len = torch.tensor([len(images)])
             
@@ -101,27 +105,20 @@ def validate(model, df_val, cfg, device):
             
             best_idx = np.argmax(preds)
             best_score = scores[best_idx]
-            
             max_possible = max(scores)
             
+
+            picked_tier = 2 if best_score >=8 else (1 if best_score >=3 else 0)
+            max_tier = 2 if max_possible >=8 else (1 if max_possible >=3 else 0)
             
-            if best_score >= 8:
-                strict_wins += 1 
-            elif max_possible < 8 and best_score >= 3:
-                strict_wins += 1 
-            elif max_possible < 3:
-                strict_wins += 1 
+            if picked_tier == max_tier:
+                strict_wins += 1
                 
             total_groups += 1
             
-            if not debug_printed:
-                print(f"[DEBUG] Preds: {preds[:5]} | GT: {scores[:5]}")
-                debug_printed = True
-                
     return strict_wins / total_groups if total_groups > 0 else 0.0
 
 def save_checkpoint(model, optimizer, epoch, path, is_best=False):
-    # Handle DDP wrapping
     raw_model = model.module if hasattr(model, "module") else model
     checkpoint = {
         'epoch': epoch,
@@ -150,7 +147,6 @@ def main():
     
     unique_groups = df['group_id'].unique()
     val_groups = unique_groups[:int(len(unique_groups) * 0.1)]
-    
     train_df = df[~df['group_id'].isin(val_groups)]
     val_df = df[df['group_id'].isin(val_groups)]
     
@@ -165,16 +161,25 @@ def main():
     device = torch.device(f"cuda:{local_rank}")
     model = MobileCLIPRanker(cfg).to(device)
     
-    if dist.is_initialized(): 
-        model = DDP(model, device_ids=[local_rank])
+    if dist.is_initialized(): model = DDP(model, device_ids=[local_rank])
     
-    optimizer = optim.AdamW(model.parameters(), lr=cfg.train.lr_head, weight_decay=cfg.train.weight_decay)
+    raw_model = model.module if hasattr(model, "module") else model
+    backbone_params = []
+    head_params = []
+    for name, param in raw_model.named_parameters():
+        if not param.requires_grad: continue
+        if "head" in name:
+            head_params.append(param)
+        else:
+            backbone_params.append(param)
+
+    optimizer = optim.AdamW([
+        {'params': backbone_params, 'lr': cfg.train.lr_backbone},
+        {'params': head_params, 'lr': cfg.train.lr_head}
+    ], weight_decay=cfg.train.weight_decay)
     
     best_acc = 0.0
     
-    if rank == 0:
-        print(f"Training on {len(train_ds)} items.")
-
     for epoch in range(cfg.train.epochs):
         model.train()
         total_loss = 0.0
@@ -197,8 +202,8 @@ def main():
         if rank == 0:
             avg_loss = total_loss / len(train_loader)
             
-            raw_model = model.module if hasattr(model, 'module') else model
-            acc = validate(raw_model, val_df, cfg, device)
+            raw_model_val = model.module if hasattr(model, 'module') else model
+            acc = validate(raw_model_val, val_df, cfg, device)
             
             print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Strict Accuracy: {acc:.2%}")
             

@@ -3,6 +3,7 @@ from torch.utils.data import Dataset
 from PIL import Image
 from torchvision import transforms
 import os
+import pandas as pd
 
 class PropertyPreferenceDataset(Dataset):
     def __init__(self, df, images_dir="images", is_train=False, img_size=224):
@@ -38,10 +39,29 @@ class PropertyPreferenceDataset(Dataset):
 
     def __getitem__(self, idx):
         records = self.groups[idx]
-        selected = records[:15] 
+        selected = records[:15]
         
-        tensors = [self._process(r['file_path']) for r in selected]
-        scores = [float(r['score']) for r in selected]
+        tensors = []
+        scores = []
+        
+        for r in selected:
+            tensors.append(self._process(r['file_path']))
+            
+            raw_score = float(r['score'])
+            label = str(r.get('label', '')).lower()
+            
+
+            if raw_score >= 8:
+                if label in ['outdoor', 'bathroom', 'other', 'balcony']:
+                    final_score = 0.0 
+                elif label in ['bedroom']:
+                    final_score = 3.0 
+                else:
+                    final_score = raw_score
+            else:
+                final_score = raw_score
+                
+            scores.append(final_score)
         
         pad = 15 - len(tensors)
         if pad > 0:
