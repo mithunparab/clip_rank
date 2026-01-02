@@ -12,7 +12,7 @@ data:
   n_splits: 10
 
 model:
-  name: "mobileclip_b"
+  name: "mobileclip2_l14"
 
 train:
   batch_size: 1
