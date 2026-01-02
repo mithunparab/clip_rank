@@ -26,37 +26,26 @@ def setup_ddp():
 def cleanup_ddp():
     if dist.is_initialized(): dist.destroy_process_group()
 
-def ordinal_margin_loss(pred_scores, gt_scores, valid_len):
+def listwise_softmax_loss(pred_scores, gt_scores, valid_len):
     loss = 0.0
-    n_pairs = 0
-    
-    tiers = torch.zeros_like(gt_scores)
-    tiers[gt_scores >= 8] = 2.0
-    tiers[(gt_scores >= 3) & (gt_scores < 8)] = 1.0
+    valid_batches = 0
+    ce_loss = nn.CrossEntropyLoss()
     
     for b in range(pred_scores.shape[0]):
         n = int(valid_len[b].item())
         if n < 2: continue
         
-        p = pred_scores[b, :n].view(-1)
-        t = tiers[b, :n]
+        logits = pred_scores[b, :n].view(1, -1)
+        gts = gt_scores[b, :n]
         
-        tier_diff = t.unsqueeze(0) - t.unsqueeze(1)
-        pairs = torch.nonzero(tier_diff > 0)
+        target_idx = torch.argmax(gts).unsqueeze(0)
         
-        if len(pairs) == 0: continue
-            
-        for idx in pairs:
-            i, j = idx[0], idx[1]
-            dist_val = tier_diff[i, j].item()
-            
-            margin = 1.0 if dist_val == 1.0 else 2.5
-            current_gap = p[i] - p[j]
-            loss += torch.relu(margin - current_gap)
-            n_pairs += 1
-            
-    if n_pairs > 0:
-        return loss / n_pairs
+        batch_loss = ce_loss(logits, target_idx)
+        loss += batch_loss
+        valid_batches += 1
+        
+    if valid_batches > 0:
+        return loss / valid_batches
     return pred_scores.sum() * 0.0
 
 def validate(model, df_val, cfg, device):
@@ -153,14 +142,28 @@ def main():
     if dist.is_initialized(): 
         model = DDP(model, device_ids=[local_rank])
     
-    optimizer = optim.AdamW(model.parameters(), lr=cfg.train.lr_head, weight_decay=cfg.train.weight_decay)
+    raw_model = model.module if hasattr(model, "module") else model
+    
+    backbone_params = []
+    head_params = []
+    for name, param in raw_model.named_parameters():
+        if not param.requires_grad: continue
+        if "head" in name:
+            head_params.append(param)
+        else:
+            backbone_params.append(param)
+
+    optimizer = optim.AdamW([
+        {'params': backbone_params, 'lr': cfg.train.lr_backbone},
+        {'params': head_params, 'lr': cfg.train.lr_head}
+    ], weight_decay=cfg.train.weight_decay)
     
     best_acc = 0.0
     patience = 10
     patience_counter = 0
     
     if rank == 0:
-        print(f"Training on {len(train_ds)} groups.")
+        print(f"Training on {len(train_ds)} groups (Listwise Softmax).")
 
     for epoch in range(cfg.train.epochs):
         model.train()
@@ -174,7 +177,8 @@ def main():
             optimizer.zero_grad()
             preds = model(imgs, vlen)
             
-            loss = ordinal_margin_loss(preds, scores, vlen)
+            # THE FIX: Using Listwise Softmax
+            loss = listwise_softmax_loss(preds, scores, vlen)
             loss.backward()
             
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
@@ -183,9 +187,8 @@ def main():
             
         if rank == 0:
             avg_loss = total_loss / len(train_loader)
-            
-            raw_model = model.module if hasattr(model, 'module') else model
-            acc = validate(raw_model, val_df, cfg, device)
+            raw_val_model = model.module if hasattr(model, 'module') else model
+            acc = validate(raw_val_model, val_df, cfg, device)
             
             print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Strict Accuracy: {acc:.2%}")
             
@@ -198,7 +201,7 @@ def main():
                 save_checkpoint(model, optimizer, epoch + 1, f"{cfg.train.save_dir}/last.pth", is_best=False)
                 
             if patience_counter >= patience:
-                print(f"Early stopping triggered. No improvement for {patience} epochs.")
+                print(f"Early stopping triggered. Best Accuracy: {best_acc:.2%}")
                 break
 
     cleanup_ddp()

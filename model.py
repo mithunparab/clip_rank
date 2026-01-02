@@ -16,7 +16,6 @@ class MobileCLIPRanker(nn.Module):
         self.backbone = model.image_encoder
         self.backbone_dim = 512 
         
-
         self.backbone.eval()
         for param in self.backbone.parameters():
             param.requires_grad = False
@@ -30,7 +29,7 @@ class MobileCLIPRanker(nn.Module):
         
     def train(self, mode=True):
         super().train(mode)
-        self.backbone.eval() 
+        self.backbone.eval()
         return self
 
     def forward(self, x, valid_lens=None):
