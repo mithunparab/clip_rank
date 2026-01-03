@@ -14,6 +14,8 @@ class MobileCLIPRanker(nn.Module):
             self.model_type = "open_clip"
             repo_id = "apple/MobileCLIP2-L-14"
             filename = "mobileclip2_l14.pt"
+            
+            print(f"Initializing OpenCLIP L14 backbone...")
             ckpt_path = hf_hub_download(repo_id=repo_id, filename=filename)
             
             model, _, _ = open_clip.create_model_and_transforms(
@@ -37,6 +39,7 @@ class MobileCLIPRanker(nn.Module):
                 filename = "mobileclip2_b.pt"
                 arch = "mobileclip_b"
                 
+            print(f"Initializing MobileCLIP {arch} backbone...")
             ckpt_path = hf_hub_download(repo_id=repo_id, filename=filename)
             model, _, _ = mobileclip.create_model_and_transforms(arch, pretrained=ckpt_path)
             self.backbone = model.image_encoder
