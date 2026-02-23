@@ -10,16 +10,25 @@ data:
   max_images_per_group: 15
   val_fold: 0
   n_splits: 10
+  cached_features_dir: "cached_features"
 
 model:
   name: "mobileclip2_l14"
+  head_hidden_dim: 256
+  head_dropout: 0.1
 
 train:
   batch_size: 1
-  lr_head: 0.001          
-  lr_backbone: 0.00001    
-  epochs: 3
+  lr_head: 0.001
+  lr_backbone: 0.00001
+  epochs: 15
   weight_decay: 0.01
   grad_clip: 1.0
   seed: 42
   save_dir: "checkpoints"
+  patience: 15
+  # New training params
+  temperature: 0.3
+  margin_weight: 0.5
+  gradient_accumulation_steps: 4
+  use_cached_features: false
