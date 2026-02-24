@@ -3,6 +3,7 @@ from torch.utils.data import Dataset
 from PIL import Image
 from torchvision import transforms
 import os
+import random
 import pandas as pd
 
 
@@ -53,7 +54,10 @@ class PropertyPreferenceDataset(Dataset):
 
     def __getitem__(self, idx):
         records = self.groups[idx]
-        selected = records[:15]
+        if len(records) > 15:
+            selected = random.sample(records, 15)
+        else:
+            selected = records
 
         tensors = []
         scores = []
