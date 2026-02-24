@@ -269,7 +269,7 @@ def main():
         np.random.seed(seed + worker_id)
 
     train_loader = DataLoader(
-        train_ds, batch_size=1, sampler=sampler,
+        train_ds, batch_size=cfg.train.batch_size, sampler=sampler,
         shuffle=(sampler is None),
         num_workers=cfg.system.num_workers if not use_cached else 2,
         pin_memory=cfg.system.pin_memory,
