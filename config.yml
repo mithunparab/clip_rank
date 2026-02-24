@@ -29,8 +29,10 @@ train:
   seed: 42
   save_dir: "checkpoints"
   patience: 15
-  # New training params
+  # KLD with score-proportional soft targets
   temperature: 0.3
+  target_temperature: 2.0
   margin_weight: 0.5
+  warmup_epochs: 3
   gradient_accumulation_steps: 4
   use_cached_features: false
