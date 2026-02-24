@@ -71,7 +71,11 @@ class MobileCLIPRanker(nn.Module):
             model, _, _ = mobileclip.create_model_and_transforms(v["arch"], pretrained=ckpt_path)
             self.backbone = model.image_encoder
 
-        self.backbone_dim = v["dim"]
+        # Auto-detect backbone output dim instead of trusting registry
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, 224, 224)
+            self.backbone_dim = self.backbone(dummy).shape[-1]
+        print(f"  backbone_dim={self.backbone_dim}")
 
         self.backbone.eval()
         for param in self.backbone.parameters():
