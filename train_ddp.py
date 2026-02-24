@@ -31,10 +31,13 @@ def cleanup_ddp():
         dist.destroy_process_group()
 
 
-def listwise_kl_loss(pred_scores, gt_scores, valid_len, temperature=1.0):
+def listwise_kl_loss(pred_scores, gt_scores, valid_len, temperature=1.0, target_temperature=2.0):
     """
-    Listwise KL-divergence loss with temperature scaling.
-    Lower temperature = sharper distributions = stronger gradient signal.
+    KL divergence with score-proportional soft targets.
+
+    Old target: hard tier — [0, 0, 0, 0.5, 0.5] — gradient vanishes once tier is correct.
+    New target: softmax(gt/T) — [0.005, 0.005, 0.021, 0.261, 0.709] — gradient persists
+    because the model must match score MAGNITUDES, not just the correct tier.
     """
     loss = 0.0
     valid_batches = 0
@@ -47,17 +50,8 @@ def listwise_kl_loss(pred_scores, gt_scores, valid_len, temperature=1.0):
         logits = pred_scores[b, :n].view(-1)
         gts = gt_scores[b, :n]
 
-        target_probs = torch.zeros_like(logits, dtype=torch.float32)
-
-        is_gold = gts >= 8
-        is_silver = (gts >= 3) & (gts < 8)
-
-        if is_gold.sum() > 0:
-            target_probs[is_gold] = 1.0 / is_gold.sum()
-        elif is_silver.sum() > 0:
-            target_probs[is_silver] = 1.0 / is_silver.sum()
-        else:
-            target_probs.fill_(1.0 / n)
+        # Score-proportional soft targets: the terrain signal
+        target_probs = F.softmax(gts / target_temperature, dim=0)
 
         log_probs = F.log_softmax(logits / temperature, dim=0)
         batch_loss = -torch.sum(target_probs * log_probs)
@@ -72,8 +66,8 @@ def listwise_kl_loss(pred_scores, gt_scores, valid_len, temperature=1.0):
 
 def pairwise_margin_loss(pred_scores, gt_scores, valid_len, margin=1.0):
     """
-    Pairwise margin loss: gold items should score higher than non-gold by margin.
-    Complements KL loss with a direct ranking signal.
+    Pairwise margin loss: higher-scored items should outscore lower-scored by margin.
+    Complements KL by enforcing minimum score separation between tiers.
     """
     loss = 0.0
     count = 0
@@ -109,6 +103,26 @@ def pairwise_margin_loss(pred_scores, gt_scores, valid_len, margin=1.0):
     return pred_scores.sum() * 0.0
 
 
+def compute_ndcg(pred_scores, gt_scores):
+    """NDCG: measures full ranking quality, not just top-1 tier."""
+    n = len(pred_scores)
+    if n < 2:
+        return 1.0
+
+    pred_order = np.argsort(-pred_scores)
+    ordered_gt = gt_scores[pred_order]
+
+    discounts = np.log2(np.arange(n) + 2)
+    dcg = np.sum((2 ** ordered_gt - 1) / discounts)
+
+    ideal_gt = np.sort(gt_scores)[::-1]
+    idcg = np.sum((2 ** ideal_gt - 1) / discounts)
+
+    if idcg == 0:
+        return 1.0
+    return dcg / idcg
+
+
 def validate(model, df_val, cfg, device, use_cached=False, cache_dir="cached_features"):
     model.eval()
 
@@ -126,6 +140,7 @@ def validate(model, df_val, cfg, device, use_cached=False, cache_dir="cached_fea
     grouped = df_val.groupby('group_id')
     strict_wins = 0
     total_groups = 0
+    ndcg_scores = []
 
     with torch.no_grad():
         for _, group in grouped:
@@ -145,7 +160,9 @@ def validate(model, df_val, cfg, device, use_cached=False, cache_dir="cached_fea
             valid_len = torch.tensor([len(images)])
 
             preds = model(batch, valid_lens=valid_len).view(-1).cpu().numpy()
+            gt_arr = np.array(scores)
 
+            # Strict tier accuracy
             best_idx = np.argmax(preds)
             best_score = scores[best_idx]
             max_possible = max(scores)
@@ -156,9 +173,14 @@ def validate(model, df_val, cfg, device, use_cached=False, cache_dir="cached_fea
             if picked_tier == max_tier:
                 strict_wins += 1
 
+            # NDCG — full ranking quality
+            ndcg_scores.append(compute_ndcg(preds, gt_arr))
+
             total_groups += 1
 
-    return strict_wins / total_groups if total_groups > 0 else 0.0
+    acc = strict_wins / total_groups if total_groups > 0 else 0.0
+    ndcg = np.mean(ndcg_scores) if ndcg_scores else 0.0
+    return acc, ndcg
 
 
 def _validate_cached(model, df_val, device, cache_dir):
@@ -170,6 +192,7 @@ def _validate_cached(model, df_val, device, cache_dir):
     grouped = df_val.groupby('group_id')
     strict_wins = 0
     total_groups = 0
+    ndcg_scores = []
 
     with torch.no_grad():
         for _, group in grouped:
@@ -192,6 +215,7 @@ def _validate_cached(model, df_val, device, cache_dir):
             valid_len = torch.tensor([len(features)])
 
             preds = model.head(batch).view(-1).cpu().numpy()
+            gt_arr = np.array(scores)
 
             best_idx = np.argmax(preds)
             best_score = scores[best_idx]
@@ -202,9 +226,13 @@ def _validate_cached(model, df_val, device, cache_dir):
 
             if picked_tier == max_tier:
                 strict_wins += 1
+
+            ndcg_scores.append(compute_ndcg(preds, gt_arr))
             total_groups += 1
 
-    return strict_wins / total_groups if total_groups > 0 else 0.0
+    acc = strict_wins / total_groups if total_groups > 0 else 0.0
+    ndcg = np.mean(ndcg_scores) if ndcg_scores else 0.0
+    return acc, ndcg
 
 
 def save_checkpoint(model, optimizer, epoch, path, is_best=False):
@@ -242,8 +270,10 @@ def main():
 
     # Config with defaults for new params
     temperature = getattr(cfg.train, 'temperature', 0.3)
+    target_temperature = getattr(cfg.train, 'target_temperature', 2.0)
     margin_weight = getattr(cfg.train, 'margin_weight', 0.5)
     accum_steps = getattr(cfg.train, 'gradient_accumulation_steps', 4)
+    warmup_epochs = getattr(cfg.train, 'warmup_epochs', 3)
     use_cached = args.cached or getattr(cfg.train, 'use_cached_features', False)
     cache_dir = getattr(cfg.data, 'cached_features_dir', 'cached_features')
 
@@ -298,7 +328,15 @@ def main():
         {'params': head_params, 'lr': cfg.train.lr_head}
     ], weight_decay=cfg.train.weight_decay)
 
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.train.epochs, eta_min=1e-6)
+    warmup_sched = optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=1.0 / max(warmup_epochs, 1), total_iters=warmup_epochs
+    )
+    cosine_sched = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(cfg.train.epochs - warmup_epochs, 1), eta_min=1e-7
+    )
+    scheduler = optim.lr_scheduler.SequentialLR(
+        optimizer, [warmup_sched, cosine_sched], milestones=[warmup_epochs]
+    )
 
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda") if use_amp else None
@@ -308,8 +346,8 @@ def main():
     patience_counter = 0
 
     if rank == 0:
-        print(f"Training on {len(train_ds)} groups | temperature={temperature} | "
-              f"margin_weight={margin_weight} | accum_steps={accum_steps} | AMP={use_amp}")
+        print(f"Training on {len(train_ds)} groups | KLD(T={temperature},T_target={target_temperature})+Margin(w={margin_weight}) | "
+              f"accum_steps={accum_steps} | warmup={warmup_epochs} | AMP={use_amp}")
 
     for epoch in range(cfg.train.epochs):
         model.train()
@@ -328,7 +366,7 @@ def main():
             if use_amp:
                 with torch.amp.autocast("cuda"):
                     preds = model(data, vlen)
-                    kl = listwise_kl_loss(preds, scores, vlen, temperature=temperature)
+                    kl = listwise_kl_loss(preds, scores, vlen, temperature=temperature, target_temperature=target_temperature)
                     margin = pairwise_margin_loss(preds, scores, vlen)
                     loss = kl + margin_weight * margin
                     loss = loss / accum_steps
@@ -343,7 +381,7 @@ def main():
                     optimizer.zero_grad(set_to_none=True)
             else:
                 preds = model(data, vlen)
-                kl = listwise_kl_loss(preds, scores, vlen, temperature=temperature)
+                kl = listwise_kl_loss(preds, scores, vlen, temperature=temperature, target_temperature=target_temperature)
                 margin = pairwise_margin_loss(preds, scores, vlen)
                 loss = kl + margin_weight * margin
                 loss = loss / accum_steps
@@ -362,9 +400,10 @@ def main():
         if rank == 0:
             avg_loss = total_loss / len(train_loader)
             raw_val = model.module if hasattr(model, 'module') else model
-            acc = validate(raw_val, val_df, cfg, device, use_cached=use_cached, cache_dir=cache_dir)
+            acc, ndcg = validate(raw_val, val_df, cfg, device, use_cached=use_cached, cache_dir=cache_dir)
 
-            print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Strict Accuracy: {acc:.2%}")
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Acc: {acc:.2%} | NDCG: {ndcg:.4f} | LR: {current_lr:.2e}")
 
             if acc > best_acc:
                 best_acc = acc
@@ -375,7 +414,7 @@ def main():
                 save_checkpoint(model, optimizer, epoch + 1, f"{cfg.train.save_dir}/last.pth", is_best=False)
 
             if patience_counter >= patience:
-                print(f"Early stopping. Best: {best_acc:.2%}")
+                print(f"Early stopping. Best Acc: {best_acc:.2%}")
                 break
 
     cleanup_ddp()

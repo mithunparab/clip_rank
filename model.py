@@ -96,8 +96,7 @@ class MobileCLIPRanker(nn.Module):
         if x.dim() == 5:
             b, g, c, h, w = x.shape
             x_flat = x.view(b * g, c, h, w)
-            with torch.no_grad():
-                features = self.backbone(x_flat)
+            features = self.backbone(x_flat)
             features = features.view(b, g, -1)
         else:
             features = x
