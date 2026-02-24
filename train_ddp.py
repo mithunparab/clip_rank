@@ -47,7 +47,7 @@ def listwise_kl_loss(pred_scores, gt_scores, valid_len, temperature=1.0):
         logits = pred_scores[b, :n].view(-1)
         gts = gt_scores[b, :n]
 
-        target_probs = torch.zeros_like(logits)
+        target_probs = torch.zeros_like(logits, dtype=torch.float32)
 
         is_gold = gts >= 8
         is_silver = (gts >= 3) & (gts < 8)
@@ -87,7 +87,7 @@ def pairwise_margin_loss(pred_scores, gt_scores, valid_len, margin=1.0):
         gts = gt_scores[b, :n]
 
         # Tier: 2=gold(>=8), 1=silver(>=3), 0=rest
-        tiers = torch.zeros_like(gts)
+        tiers = torch.zeros_like(gts, dtype=torch.float32)
         tiers[gts >= 3] = 1
         tiers[gts >= 8] = 2
 
