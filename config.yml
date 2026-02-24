@@ -23,7 +23,7 @@ train:
   batch_size: 2
   lr_head: 0.001
   lr_backbone: 0.000001
-  epochs: 15
+  epochs: 10
   weight_decay: 0.01
   grad_clip: 1.0
   seed: 42
