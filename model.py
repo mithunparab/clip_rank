@@ -65,7 +65,7 @@ class MobileCLIPRanker(nn.Module):
         for param in self.backbone.parameters():
             param.requires_grad = False
 
-        params_to_train = list(self.backbone.named_parameters())[-60:]
+        params_to_train = list(self.backbone.named_parameters())[-30:]
         for name, param in params_to_train:
             param.requires_grad = True
 
