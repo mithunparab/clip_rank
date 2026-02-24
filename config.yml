@@ -13,12 +13,14 @@ data:
   cached_features_dir: "cached_features"
 
 model:
+  # mobileclip2_s0 | mobileclip2_s3 | mobileclip2_b | mobileclip2_l14
   name: "mobileclip2_l14"
   head_hidden_dim: 256
   head_dropout: 0.1
+  unfreeze_last: 60
 
 train:
-  batch_size: 1
+  batch_size: 2
   lr_head: 0.001
   lr_backbone: 0.00001
   epochs: 15
