@@ -1,0 +1,26 @@
+# Claude
+CLAUDE.md
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Data & checkpoints
+images/
+cached_features/
+checkpoints/
+*.pth
+
+# Environment
+.env
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
