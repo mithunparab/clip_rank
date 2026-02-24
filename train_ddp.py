@@ -229,9 +229,14 @@ def main():
     rank, local_rank = setup_ddp()
     cfg = load_config("config.yml")
 
+    import random
     seed = getattr(cfg.train, 'seed', 42)
+    random.seed(seed)
     torch.manual_seed(seed)
     np.random.seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     os.makedirs(cfg.train.save_dir, exist_ok=True)
 
@@ -258,13 +263,17 @@ def main():
     else:
         train_ds = PropertyPreferenceDataset(train_df, images_dir="images", is_train=True, img_size=cfg.data.img_size)
 
-    sampler = DistributedSampler(train_ds, shuffle=True) if dist.is_initialized() else None
+    sampler = DistributedSampler(train_ds, shuffle=True, seed=seed) if dist.is_initialized() else None
+
+    def worker_init_fn(worker_id):
+        np.random.seed(seed + worker_id)
 
     train_loader = DataLoader(
         train_ds, batch_size=1, sampler=sampler,
         shuffle=(sampler is None),
         num_workers=cfg.system.num_workers if not use_cached else 2,
         pin_memory=cfg.system.pin_memory,
+        worker_init_fn=worker_init_fn,
     )
 
     device = torch.device(f"cuda:{local_rank}")
