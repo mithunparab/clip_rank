@@ -54,10 +54,7 @@ class PropertyPreferenceDataset(Dataset):
 
     def __getitem__(self, idx):
         records = self.groups[idx]
-        if len(records) > 15:
-            selected = random.sample(records, 15)
-        else:
-            selected = records
+        selected = records[:15]
 
         tensors = []
         scores = []
