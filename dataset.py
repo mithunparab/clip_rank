@@ -3,7 +3,6 @@ from torch.utils.data import Dataset
 from PIL import Image
 from torchvision import transforms
 import os
-import random
 import pandas as pd
 
 
