@@ -4,6 +4,38 @@ import mobileclip
 import open_clip
 from huggingface_hub import hf_hub_download
 
+# MobileCLIP2 variant registry: name -> (repo_id, filename, arch, embed_dim, loader)
+VARIANTS = {
+    "mobileclip2_s0": {
+        "repo": "apple/MobileCLIP2-S0",
+        "file": "mobileclip2_s0.pt",
+        "arch": "mobileclip2_s0",
+        "dim": 512,
+        "loader": "mobileclip",
+    },
+    "mobileclip2_s3": {
+        "repo": "apple/MobileCLIP2-S3",
+        "file": "mobileclip2_s3.pt",
+        "arch": "mobileclip2_s3",
+        "dim": 512,
+        "loader": "mobileclip",
+    },
+    "mobileclip2_b": {
+        "repo": "apple/MobileCLIP2-B",
+        "file": "mobileclip2_b.pt",
+        "arch": "mobileclip_b",
+        "dim": 512,
+        "loader": "mobileclip",
+    },
+    "mobileclip2_l14": {
+        "repo": "apple/MobileCLIP2-L-14",
+        "file": "mobileclip2_l14.pt",
+        "arch": "MobileCLIP2-L-14",
+        "dim": 768,
+        "loader": "open_clip",
+    },
+}
+
 
 class RankingHead(nn.Module):
     """2-layer MLP head with dropout. More capacity than a single linear."""
@@ -24,48 +56,29 @@ class MobileCLIPRanker(nn.Module):
     def __init__(self, cfg):
         super().__init__()
 
-        self.model_type = "mobileclip"
+        name = cfg.model.name.lower()
+        if name not in VARIANTS:
+            raise ValueError(f"Unknown model '{name}'. Choose from: {list(VARIANTS.keys())}")
 
-        if "l14" in cfg.model.name.lower() or "l-14" in cfg.model.name.lower():
-            self.model_type = "open_clip"
-            repo_id = "apple/MobileCLIP2-L-14"
-            filename = "mobileclip2_l14.pt"
+        v = VARIANTS[name]
+        print(f"Initializing {name} backbone...")
+        ckpt_path = hf_hub_download(repo_id=v["repo"], filename=v["file"])
 
-            print(f"Initializing OpenCLIP L14 backbone...")
-            ckpt_path = hf_hub_download(repo_id=repo_id, filename=filename)
-
-            model, _, _ = open_clip.create_model_and_transforms(
-                'MobileCLIP2-L-14',
-                pretrained=ckpt_path
-            )
+        if v["loader"] == "open_clip":
+            model, _, _ = open_clip.create_model_and_transforms(v["arch"], pretrained=ckpt_path)
             self.backbone = model.visual
-            self.backbone_dim = 768
-
         else:
-            if "s3" in cfg.model.name.lower():
-                repo_id = "apple/MobileCLIP2-S3"
-                filename = "mobileclip2_s3.pt"
-                arch = "mobileclip2_s3"
-            elif "s0" in cfg.model.name.lower():
-                repo_id = "apple/MobileCLIP2-S0"
-                filename = "mobileclip2_s0.pt"
-                arch = "mobileclip2_s0"
-            else:
-                repo_id = "apple/MobileCLIP2-B"
-                filename = "mobileclip2_b.pt"
-                arch = "mobileclip_b"
-
-            print(f"Initializing MobileCLIP {arch} backbone...")
-            ckpt_path = hf_hub_download(repo_id=repo_id, filename=filename)
-            model, _, _ = mobileclip.create_model_and_transforms(arch, pretrained=ckpt_path)
+            model, _, _ = mobileclip.create_model_and_transforms(v["arch"], pretrained=ckpt_path)
             self.backbone = model.image_encoder
-            self.backbone_dim = 512
+
+        self.backbone_dim = v["dim"]
 
         self.backbone.eval()
         for param in self.backbone.parameters():
             param.requires_grad = False
 
-        params_to_train = list(self.backbone.named_parameters())[-60:]
+        unfreeze = getattr(cfg.model, "unfreeze_last", 60)
+        params_to_train = list(self.backbone.named_parameters())[-unfreeze:]
         for name, param in params_to_train:
             param.requires_grad = True
 
@@ -87,7 +100,6 @@ class MobileCLIPRanker(nn.Module):
                 features = self.backbone(x_flat)
             features = features.view(b, g, -1)
         else:
-            # Already precomputed features: (b, g, dim)
             features = x
 
         scores = self.head(features)
