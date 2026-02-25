@@ -1,11 +1,11 @@
 """
-Benchmark: PyTorch vs torch.compile vs ONNX vs OpenVINO.
+Benchmark: PyTorch vs OpenVINO.
 Reports per-image latency and (optionally) accuracy on the validation set.
 
 Usage:
   python inference_onnx.py                                    # timing only
   python inference_onnx.py --validate                         # + accuracy
-  python inference_onnx.py --checkpoint path.pth --threads 4  # custom
+  python inference_onnx.py --threads 4                        # limit threads
 """
 
 import argparse
@@ -17,7 +17,6 @@ import numpy as np
 import pandas as pd
 import requests
 import torch
-import onnxruntime as ort
 from PIL import Image
 from io import BytesIO
 from torchvision import transforms
@@ -32,9 +31,6 @@ HF_CHECKPOINT = (
 )
 
 
-# ---------------------------------------------------------------------------
-# Preprocessing (matches training exactly)
-# ---------------------------------------------------------------------------
 def build_transform(img_size=224):
     mean, std = get_norm_stats("mobileclip2_l14")
     return transforms.Compose([
@@ -55,7 +51,7 @@ def load_image(src):
 # Backends
 # ---------------------------------------------------------------------------
 class PyTorchBackend:
-    name = "PyTorch"
+    name = "PyTorch FP32"
 
     def __init__(self, checkpoint, cfg):
         cfg.model.name = "mobileclip2_l14"
@@ -71,43 +67,6 @@ class PyTorchBackend:
         t = torch.from_numpy(batch_np)
         feat = self.model.backbone(t)
         return self.model.head(feat).numpy().flatten()
-
-
-class TorchCompileBackend:
-    name = "torch.compile"
-
-    def __init__(self, checkpoint, cfg, mode="max-autotune"):
-        cfg.model.name = "mobileclip2_l14"
-        self.model = MobileCLIPRanker(cfg)
-        ckpt = torch.load(checkpoint, map_location="cpu")
-        sd = ckpt.get("model_state_dict", ckpt)
-        sd = {k.replace("module.", ""): v for k, v in sd.items()}
-        self.model.load_state_dict(sd)
-        self.model.eval()
-        # torch.compile with TorchInductor — generates optimized C++/OpenMP
-        self.backbone = torch.compile(self.model.backbone, mode=mode)
-        self.head = torch.compile(self.model.head, mode=mode)
-        self.name = f"torch.compile({mode})"
-
-    @torch.no_grad()
-    def __call__(self, batch_np):
-        t = torch.from_numpy(batch_np)
-        feat = self.backbone(t)
-        return self.head(feat).numpy().flatten()
-
-
-class ONNXBackend:
-    def __init__(self, path, name, threads=None):
-        so = ort.SessionOptions()
-        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        if threads:
-            so.intra_op_num_threads = threads
-            so.inter_op_num_threads = threads
-        self.sess = ort.InferenceSession(path, so, providers=["CPUExecutionProvider"])
-        self.name = name
-
-    def __call__(self, batch_np):
-        return self.sess.run(None, {"images": batch_np})[0].flatten()
 
 
 class OpenVINOBackend:
@@ -146,9 +105,6 @@ def benchmark(backend, batch_np, warmup=5, runs=20):
     }
 
 
-# ---------------------------------------------------------------------------
-# Validation (mirrors train_ddp.py validate logic)
-# ---------------------------------------------------------------------------
 def compute_ndcg(preds, gts):
     n = len(preds)
     if n < 2:
@@ -193,9 +149,6 @@ def validate(backend, val_df, tf, images_dir="images"):
     return acc, ndcg
 
 
-# ---------------------------------------------------------------------------
-# Rank (production-style: URL list in, sorted results out)
-# ---------------------------------------------------------------------------
 def rank_images(backend, image_list, tf):
     tensors, clean = [], []
     for src in image_list:
@@ -211,9 +164,6 @@ def rank_images(backend, image_list, tf):
     return [{"source": s, "score": float(sc)} for s, sc in results]
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 def find_checkpoint(path=None):
     if path and os.path.exists(path):
         return path
@@ -236,33 +186,15 @@ def main():
     cfg = load_config("config.yml")
     tf = build_transform(cfg.data.img_size)
 
-    # --- Load backends ---
     backends = []
 
     ckpt = find_checkpoint(args.checkpoint)
     if ckpt:
         print(f"Loading PyTorch L14 from {ckpt}")
         backends.append(PyTorchBackend(ckpt, cfg))
-
-        # torch.compile (PyTorch 2.x) — first call is slow (compilation), then fast
-        print("Loading torch.compile (max-autotune)... first run compiles, be patient")
-        backends.append(TorchCompileBackend(ckpt, cfg, mode="max-autotune"))
     else:
-        print("No .pth found, skipping PyTorch backends")
+        print("No .pth found, skipping PyTorch backend")
 
-    onnx_files = [
-        ("ranker_fp32.onnx", "ONNX FP32"),
-        ("ranker_optimized.onnx", "ONNX Optimized"),
-    ]
-    for fname, label in onnx_files:
-        fpath = os.path.join(args.onnx_dir, fname)
-        if os.path.exists(fpath):
-            print(f"Loading {label} from {fpath}")
-            backends.append(ONNXBackend(fpath, label, args.threads))
-        else:
-            print(f"  {fpath} not found, skipping")
-
-    # OpenVINO
     ov_xml = os.path.join(args.onnx_dir, "openvino", "ranker.xml")
     if os.path.exists(ov_xml):
         try:
@@ -277,7 +209,6 @@ def main():
         print("No backends available.")
         return
 
-    # --- Download test images ---
     test_urls = [
         "https://ap.rdcpix.com/69fe76be4fd818c9b1e25b8b6c79432el-m3865337706s-w2048_h1536.jpg",
         "https://ap.rdcpix.com/69fe76be4fd818c9b1e25b8b6c79432el-m1211374265s-w2048_h1536.jpg",
@@ -289,9 +220,6 @@ def main():
     batch = torch.stack(tensors).numpy()
     print(f"Batch: {batch.shape}\n")
 
-    # =====================================================================
-    # TIMING BENCHMARK
-    # =====================================================================
     print("=" * 75)
     print(f"{'Backend':<18} {'Total (ms)':<16} {'Per Image (ms)':<18} {'vs PyTorch'}")
     print("-" * 75)
@@ -307,16 +235,6 @@ def main():
         print(f"{r['name']:<18} {r['total_ms']:>7.1f} +/- {r['std_ms']:<5.1f}  "
               f"{r['per_img_ms']:>10.1f}          {speedup:>5.2f}x")
 
-    # =====================================================================
-    # SCORE COMPARISON (same images, check ranking agreement)
-    # =====================================================================
-    print(f"\n{'Backend':<18} Scores (should match ranking order)")
-    print("-" * 75)
-    for r in results:
-        sc = "  ".join(f"{s:+.4f}" for s in r["scores"])
-        print(f"{r['name']:<18} {sc}")
-
-    # Ranking agreement check
     ref_order = np.argsort(-results[0]["scores"])
     print(f"\n{'Backend':<18} Rank Order   Match?")
     print("-" * 50)
@@ -325,18 +243,6 @@ def main():
         match = "YES" if np.array_equal(order, ref_order) else "NO"
         print(f"{r['name']:<18} {list(order)}    {match}")
 
-    # =====================================================================
-    # PRODUCTION RANKING DEMO
-    # =====================================================================
-    fastest = min(results, key=lambda r: r["total_ms"])
-    print(f"\nRanking with fastest backend ({fastest['name']}):")
-    ranked = rank_images(backends[results.index(fastest)], test_urls, tf)
-    for i, item in enumerate(ranked):
-        print(f"  {i+1}. {item['score']:+.4f}  {item['source'][-40:]}")
-
-    # =====================================================================
-    # VALIDATION (optional)
-    # =====================================================================
     if args.validate:
         csv_path = cfg.data.csv_path
         if not os.path.exists(csv_path):
