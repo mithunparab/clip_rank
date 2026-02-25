@@ -9,5 +9,6 @@ pyyaml
 pillow
 huggingface_hub
 timm
-open_clip_torch 
+open_clip_torch
+onnxruntime
 git+https://github.com/apple/ml-mobileclip.git
