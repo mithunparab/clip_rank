@@ -11,4 +11,5 @@ huggingface_hub
 timm
 open_clip_torch
 onnxruntime
+openvino
 git+https://github.com/apple/ml-mobileclip.git

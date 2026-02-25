@@ -1,5 +1,5 @@
 """
-Benchmark: PyTorch vs ONNX FP32 vs ONNX Optimized vs ONNX INT8.
+Benchmark: PyTorch vs ONNX FP32 vs ONNX Optimized vs OpenVINO.
 Reports per-image latency and (optionally) accuracy on the validation set.
 
 Usage:
@@ -85,6 +85,21 @@ class ONNXBackend:
 
     def __call__(self, batch_np):
         return self.sess.run(None, {"images": batch_np})[0].flatten()
+
+
+class OpenVINOBackend:
+    def __init__(self, xml_path, name="OpenVINO", threads=None):
+        import openvino as ov
+        core = ov.Core()
+        if threads:
+            core.set_property("CPU", {"INFERENCE_NUM_THREADS": str(threads)})
+        model = core.read_model(xml_path)
+        self.compiled = core.compile_model(model, "CPU")
+        self.output_key = self.compiled.output(0)
+        self.name = name
+
+    def __call__(self, batch_np):
+        return self.compiled({0: batch_np})[self.output_key].flatten()
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +226,6 @@ def main():
     onnx_files = [
         ("ranker_fp32.onnx", "ONNX FP32"),
         ("ranker_optimized.onnx", "ONNX Optimized"),
-        ("ranker_int8.onnx", "ONNX INT8"),
     ]
     for fname, label in onnx_files:
         fpath = os.path.join(args.onnx_dir, fname)
@@ -220,6 +234,17 @@ def main():
             backends.append(ONNXBackend(fpath, label, args.threads))
         else:
             print(f"  {fpath} not found, skipping")
+
+    # OpenVINO
+    ov_xml = os.path.join(args.onnx_dir, "openvino", "ranker.xml")
+    if os.path.exists(ov_xml):
+        try:
+            print(f"Loading OpenVINO from {ov_xml}")
+            backends.append(OpenVINOBackend(ov_xml, threads=args.threads))
+        except ImportError:
+            print("  openvino not installed, skipping")
+    else:
+        print(f"  {ov_xml} not found, skipping OpenVINO")
 
     if not backends:
         print("No backends available.")
