@@ -14,7 +14,8 @@ import torch
 import torch.nn as nn
 import onnx
 import onnxruntime as ort
-from onnxruntime.quantization import quantize_dynamic, QuantType, quant_utils
+from onnxruntime.quantization import quantize_dynamic, QuantType
+import onnxruntime.quantization.onnx_quantizer as _oq
 
 from model import MobileCLIPRanker
 from utils import load_config
@@ -115,12 +116,12 @@ def main():
     int8 = os.path.join(args.output_dir, "ranker_int8.onnx")
     print(f"\n[3/3] INT8 -> {int8}")
 
-    _orig_fn = quant_utils.save_and_reload_model_with_shape_infer
-    quant_utils.save_and_reload_model_with_shape_infer = lambda model: model
+    _orig_fn = _oq.save_and_reload_model_with_shape_infer
+    _oq.save_and_reload_model_with_shape_infer = lambda model: model
     try:
         quantize_dynamic(fp32, int8, weight_type=QuantType.QUInt8)
     finally:
-        quant_utils.save_and_reload_model_with_shape_infer = _orig_fn
+        _oq.save_and_reload_model_with_shape_infer = _orig_fn
 
     out = ort.InferenceSession(int8, providers=["CPUExecutionProvider"]).run(
         None, {"images": dummy.numpy()}
