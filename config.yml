@@ -15,7 +15,7 @@ data:
 model:
   # mobileclip2_s0 | mobileclip2_s3 | mobileclip2_s4 | mobileclip2_b | mobileclip2_l14
   # vit_b16 | vit_b32 | vit_b16_dfn | dinov3_convnext_large
-  name: "vit_b16"
+  name: "mobileclip2_l14"
   head_hidden_dim: 256
   head_dropout: 0.1
   unfreeze_last: 60
@@ -30,7 +30,6 @@ train:
   seed: 42
   save_dir: "checkpoints"
   patience: 15
-  # Soft-target KLD + lower backbone LR for stability
   temperature: 0.3
   target_temperature: 2.0
   margin_weight: 0.5
@@ -38,10 +37,7 @@ train:
   gradient_accumulation_steps: 4
   use_cached_features: false
 
-distill:
-  teacher_model_name: "mobileclip2_l14"
-  teacher_checkpoint: "/kaggle/input/notebooks/mithunparab/preference-optimization/clip_rank/checkpoints/best_model.pth"
-  student_model_name: "mobileclip2_s3"
-  alpha: 0.7
-  distill_temperature: 4.0
-  save_dir: "checkpoints_distill"
+cache:
+  embeddings_dir: "cached_embeddings"
+  # Precompute: python precompute_embeddings.py
+  # Inference:  python inference_cached.py --validate
