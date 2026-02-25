@@ -37,8 +37,8 @@ VARIANTS = {
         "dim": 768,
         "loader": "open_clip",
     },
-    "dinov3_convnext_small": {
-        "repo": "facebook/dinov3-convnext-small-pretrain-lvd1689m",
+    "dinov3_convnext_large": {
+        "repo": "facebook/dinov3-convnext-large-pretrain-lvd1689m",
         "loader": "transformers",
     },
 }
