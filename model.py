@@ -1,10 +1,13 @@
 import torch
 import torch.nn as nn
-import mobileclip
 import open_clip
 from huggingface_hub import hf_hub_download
 
-# MobileCLIP2 variant registry: name -> (repo_id, filename, arch, embed_dim, loader)
+# Normalization constants
+CLIP_NORM = ((0.481, 0.457, 0.408), (0.268, 0.261, 0.275))
+IMAGENET_NORM = ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+
+# Variant registry: name -> (repo_id, filename, arch, embed_dim, loader)
 VARIANTS = {
     "mobileclip2_s0": {
         "repo": "apple/MobileCLIP2-S0",
@@ -34,7 +37,32 @@ VARIANTS = {
         "dim": 768,
         "loader": "open_clip",
     },
+    "dinov3_convnext_tiny": {
+        "repo": "facebook/dinov3-convnext-tiny-pretrain-lvd1689m",
+        "loader": "transformers",
+    },
 }
+
+
+def get_norm_stats(model_name):
+    """Return (mean, std) normalization tuples appropriate for the model."""
+    v = VARIANTS.get(model_name.lower(), {})
+    if v.get("loader") == "transformers":
+        return IMAGENET_NORM
+    return CLIP_NORM
+
+
+class HFBackboneWrapper(nn.Module):
+    """Wraps a HuggingFace model to match the CLIP backbone interface:
+    (B, C, H, W) tensor -> (B, dim) embeddings via pooler_output."""
+
+    def __init__(self, hf_model):
+        super().__init__()
+        self.model = hf_model
+
+    def forward(self, x):
+        outputs = self.model(pixel_values=x)
+        return outputs.pooler_output
 
 
 class RankingHead(nn.Module):
@@ -62,12 +90,18 @@ class MobileCLIPRanker(nn.Module):
 
         v = VARIANTS[name]
         print(f"Initializing {name} backbone...")
-        ckpt_path = hf_hub_download(repo_id=v["repo"], filename=v["file"])
 
-        if v["loader"] == "open_clip":
+        if v["loader"] == "transformers":
+            from transformers import AutoModel
+            hf_model = AutoModel.from_pretrained(v["repo"])
+            self.backbone = HFBackboneWrapper(hf_model)
+        elif v["loader"] == "open_clip":
+            ckpt_path = hf_hub_download(repo_id=v["repo"], filename=v["file"])
             model, _, _ = open_clip.create_model_and_transforms(v["arch"], pretrained=ckpt_path)
             self.backbone = model.visual
         else:
+            import mobileclip
+            ckpt_path = hf_hub_download(repo_id=v["repo"], filename=v["file"])
             model, _, _ = mobileclip.create_model_and_transforms(v["arch"], pretrained=ckpt_path)
             self.backbone = model.image_encoder
 
