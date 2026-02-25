@@ -26,6 +26,11 @@ from model import MobileCLIPRanker, get_norm_stats
 from dataset import _remap_score
 from utils import load_config
 
+HF_CHECKPOINT = (
+    "/root/.cache/huggingface/hub/models--Nightfury16--clipick/"
+    "snapshots/3a4a7d5ac48bd8ab20b8763d135c32de49f712c8/best_model_2602.pth"
+)
+
 
 # ---------------------------------------------------------------------------
 # Preprocessing (matches training exactly)
@@ -174,7 +179,7 @@ def rank_images(backend, image_list, tf):
 def find_checkpoint(path=None):
     if path and os.path.exists(path):
         return path
-    for p in ["checkpoints/best_model.pth", "checkpoints/last.pth"]:
+    for p in [HF_CHECKPOINT, "checkpoints/best_model.pth", "checkpoints/last.pth"]:
         if os.path.exists(p):
             return p
     hits = sorted(glob.glob("checkpoints/*.pth"), key=os.path.getmtime)

@@ -3,27 +3,31 @@ Convert MobileCLIP2-L14 checkpoint -> 3 ONNX variants (FP32, Optimized, INT8).
 
 Usage:
   python convert_onnx.py --checkpoint checkpoints/best_model.pth
-  python convert_onnx.py --checkpoint /kaggle/input/notebooks/mithunparab/preference-optimization/clip_rank/checkpoints/best_model.pth
 """
 
 import argparse
 import glob
 import os
-import time
 
 import numpy as np
 import torch
 import torch.nn as nn
 import onnx
 import onnxruntime as ort
-from onnxruntime.quantization import quantize_dynamic, QuantType
+from onnxruntime.quantization import quantize_dynamic, QuantType, quant_utils
 
 from model import MobileCLIPRanker
 from utils import load_config
 
 
+HF_CHECKPOINT = (
+    "/root/.cache/huggingface/hub/models--Nightfury16--clipick/"
+    "snapshots/3a4a7d5ac48bd8ab20b8763d135c32de49f712c8/best_model_2602.pth"
+)
+
+
 class FlatRanker(nn.Module):
-    """Unwraps the grouped forward into flat (B,3,H,W) -> (B,1) for ONNX."""
+    """Flat (B,3,H,W) -> (B,1) wrapper for ONNX export."""
 
     def __init__(self, backbone, head):
         super().__init__()
@@ -37,7 +41,7 @@ class FlatRanker(nn.Module):
 def find_checkpoint(path=None):
     if path and os.path.exists(path):
         return path
-    for p in ["checkpoints/best_model.pth", "checkpoints/last.pth"]:
+    for p in [HF_CHECKPOINT, "checkpoints/best_model.pth", "checkpoints/last.pth"]:
         if os.path.exists(p):
             return p
     hits = sorted(glob.glob("checkpoints/*.pth"), key=os.path.getmtime)
@@ -105,19 +109,19 @@ def main():
     print(f"  Verify: {out.flatten()}, diff={np.abs(ref - out).max():.6f}")
 
     # --- 3. INT8 dynamic quantization ---
-    # Preprocess: fix shape inference for ViT before quantization
-    preprocessed = os.path.join(args.output_dir, "ranker_preprocessed.onnx")
-    print(f"\n[3/3] INT8 -> preprocessing shape inference...")
-    model_proto = onnx.load(fp32)
-    try:
-        model_proto = onnx.shape_inference.infer_shapes(model_proto, strict_mode=False)
-    except Exception as e:
-        print(f"  Shape inference partial (expected for ViT): {e}")
-    onnx.save(model_proto, preprocessed)
-
+    # ViT shape inference bug: quantize_dynamic internally runs
+    # onnx.shape_inference which chokes on ViT dim mismatches (1024 vs 768).
+    # Bypass by patching the internal shape-infer call to be a no-op.
     int8 = os.path.join(args.output_dir, "ranker_int8.onnx")
-    print(f"  Quantizing -> {int8}")
-    quantize_dynamic(preprocessed, int8, weight_type=QuantType.QUInt8)
+    print(f"\n[3/3] INT8 -> {int8}")
+
+    _orig_fn = quant_utils.save_and_reload_model_with_shape_infer
+    quant_utils.save_and_reload_model_with_shape_infer = lambda model: model
+    try:
+        quantize_dynamic(fp32, int8, weight_type=QuantType.QUInt8)
+    finally:
+        quant_utils.save_and_reload_model_with_shape_infer = _orig_fn
+
     out = ort.InferenceSession(int8, providers=["CPUExecutionProvider"]).run(
         None, {"images": dummy.numpy()}
     )[0]
