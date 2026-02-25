@@ -41,6 +41,13 @@ VARIANTS = {
         "repo": "facebook/dinov3-convnext-large-pretrain-lvd1689m",
         "loader": "transformers",
     },
+    "mobileclip2_s4": {
+        "repo": "apple/MobileCLIP2-S4",
+        "file": "mobileclip2_s4.pt",
+        "arch": "MobileCLIP2-S4",
+        "dim": 512,
+        "loader": "open_clip",
+    },
 }
 
 
