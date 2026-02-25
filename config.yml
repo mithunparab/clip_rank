@@ -36,3 +36,11 @@ train:
   warmup_epochs: 1
   gradient_accumulation_steps: 4
   use_cached_features: false
+
+distill:
+  teacher_model_name: "mobileclip2_l14"
+  teacher_checkpoint: "checkpoints/best_model.pth"
+  student_model_name: "mobileclip2_s3"
+  alpha: 0.7
+  distill_temperature: 4.0
+  save_dir: "checkpoints_distill"
