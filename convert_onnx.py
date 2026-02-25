@@ -14,6 +14,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+import onnx
 import onnxruntime as ort
 from onnxruntime.quantization import quantize_dynamic, QuantType
 
@@ -104,9 +105,19 @@ def main():
     print(f"  Verify: {out.flatten()}, diff={np.abs(ref - out).max():.6f}")
 
     # --- 3. INT8 dynamic quantization ---
+    # Preprocess: fix shape inference for ViT before quantization
+    preprocessed = os.path.join(args.output_dir, "ranker_preprocessed.onnx")
+    print(f"\n[3/3] INT8 -> preprocessing shape inference...")
+    model_proto = onnx.load(fp32)
+    try:
+        model_proto = onnx.shape_inference.infer_shapes(model_proto, strict_mode=False)
+    except Exception as e:
+        print(f"  Shape inference partial (expected for ViT): {e}")
+    onnx.save(model_proto, preprocessed)
+
     int8 = os.path.join(args.output_dir, "ranker_int8.onnx")
-    print(f"\n[3/3] INT8 -> {int8}")
-    quantize_dynamic(fp32, int8, weight_type=QuantType.QUInt8)
+    print(f"  Quantizing -> {int8}")
+    quantize_dynamic(preprocessed, int8, weight_type=QuantType.QUInt8)
     out = ort.InferenceSession(int8, providers=["CPUExecutionProvider"]).run(
         None, {"images": dummy.numpy()}
     )[0]
