@@ -1,5 +1,5 @@
 """
-Convert MobileCLIP2-L14 checkpoint -> 3 ONNX variants (FP32, Optimized, INT8).
+Convert MobileCLIP2-L14 checkpoint -> ONNX variants (FP32, Optimized) + OpenVINO IR.
 
 Usage:
   python convert_onnx.py --checkpoint checkpoints/best_model.pth
@@ -12,10 +12,7 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
-import onnx
 import onnxruntime as ort
-from onnxruntime.quantization import quantize_dynamic, QuantType
-import onnxruntime.quantization.onnx_quantizer as _oq
 
 from model import MobileCLIPRanker
 from utils import load_config
@@ -109,30 +106,31 @@ def main():
     )[0]
     print(f"  Verify: {out.flatten()}, diff={np.abs(ref - out).max():.6f}")
 
-    # --- 3. INT8 dynamic quantization ---
-    # ViT shape inference bug: quantize_dynamic internally runs
-    # onnx.shape_inference which chokes on ViT dim mismatches (1024 vs 768).
-    # Bypass by patching the internal shape-infer call to be a no-op.
-    int8 = os.path.join(args.output_dir, "ranker_int8.onnx")
-    print(f"\n[3/3] INT8 -> {int8}")
-
-    _orig_fn = _oq.save_and_reload_model_with_shape_infer
-    _oq.save_and_reload_model_with_shape_infer = lambda model: model
+    # --- 3. OpenVINO IR (best for Intel Xeon CPUs) ---
+    print(f"\n[3/3] OpenVINO IR")
     try:
-        quantize_dynamic(fp32, int8, weight_type=QuantType.QUInt8)
-    finally:
-        _oq.save_and_reload_model_with_shape_infer = _orig_fn
-
-    out = ort.InferenceSession(int8, providers=["CPUExecutionProvider"]).run(
-        None, {"images": dummy.numpy()}
-    )[0]
-    print(f"  Verify: {out.flatten()}, diff={np.abs(ref - out).max():.6f}")
+        import openvino as ov
+        core = ov.Core()
+        ov_model = core.read_model(fp32)
+        ov_dir = os.path.join(args.output_dir, "openvino")
+        os.makedirs(ov_dir, exist_ok=True)
+        ov.save_model(ov_model, os.path.join(ov_dir, "ranker.xml"))
+        print(f"  Saved to {ov_dir}/ranker.xml + ranker.bin")
+    except ImportError:
+        print("  openvino not installed, skipping. pip install openvino")
+    except Exception as e:
+        print(f"  OpenVINO conversion failed: {e}")
 
     # --- Summary ---
     print(f"\n{'Model':<12} {'Size MB':<10}")
     print("-" * 22)
-    for name, path in [("FP32", fp32), ("Optimized", opt), ("INT8", int8)]:
+    for name, path in [("FP32", fp32), ("Optimized", opt)]:
         print(f"{name:<12} {os.path.getsize(path)/1024/1024:<10.1f}")
+    ov_bin = os.path.join(args.output_dir, "openvino", "ranker.bin")
+    if os.path.exists(ov_bin):
+        ov_xml = os.path.join(args.output_dir, "openvino", "ranker.xml")
+        total = os.path.getsize(ov_bin) + os.path.getsize(ov_xml)
+        print(f"{'OpenVINO':<12} {total/1024/1024:<10.1f}")
 
     print("\nDone. Now run: python inference_onnx.py --validate")
 
