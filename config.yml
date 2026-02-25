@@ -39,7 +39,7 @@ train:
 
 distill:
   teacher_model_name: "mobileclip2_l14"
-  teacher_checkpoint: "checkpoints/best_model.pth"
+  teacher_checkpoint: "/kaggle/input/notebooks/mithunparab/preference-optimization/clip_rank/checkpoints/best_model.pth"
   student_model_name: "mobileclip2_s3"
   alpha: 0.7
   distill_temperature: 4.0
