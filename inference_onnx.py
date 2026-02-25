@@ -1,5 +1,5 @@
 """
-Benchmark: PyTorch vs ONNX FP32 vs ONNX Optimized vs OpenVINO.
+Benchmark: PyTorch vs torch.compile vs ONNX vs OpenVINO.
 Reports per-image latency and (optionally) accuracy on the validation set.
 
 Usage:
@@ -71,6 +71,29 @@ class PyTorchBackend:
         t = torch.from_numpy(batch_np)
         feat = self.model.backbone(t)
         return self.model.head(feat).numpy().flatten()
+
+
+class TorchCompileBackend:
+    name = "torch.compile"
+
+    def __init__(self, checkpoint, cfg, mode="max-autotune"):
+        cfg.model.name = "mobileclip2_l14"
+        self.model = MobileCLIPRanker(cfg)
+        ckpt = torch.load(checkpoint, map_location="cpu")
+        sd = ckpt.get("model_state_dict", ckpt)
+        sd = {k.replace("module.", ""): v for k, v in sd.items()}
+        self.model.load_state_dict(sd)
+        self.model.eval()
+        # torch.compile with TorchInductor — generates optimized C++/OpenMP
+        self.backbone = torch.compile(self.model.backbone, mode=mode)
+        self.head = torch.compile(self.model.head, mode=mode)
+        self.name = f"torch.compile({mode})"
+
+    @torch.no_grad()
+    def __call__(self, batch_np):
+        t = torch.from_numpy(batch_np)
+        feat = self.backbone(t)
+        return self.head(feat).numpy().flatten()
 
 
 class ONNXBackend:
@@ -220,8 +243,12 @@ def main():
     if ckpt:
         print(f"Loading PyTorch L14 from {ckpt}")
         backends.append(PyTorchBackend(ckpt, cfg))
+
+        # torch.compile (PyTorch 2.x) — first call is slow (compilation), then fast
+        print("Loading torch.compile (max-autotune)... first run compiles, be patient")
+        backends.append(TorchCompileBackend(ckpt, cfg, mode="max-autotune"))
     else:
-        print("No .pth found, skipping PyTorch backend")
+        print("No .pth found, skipping PyTorch backends")
 
     onnx_files = [
         ("ranker_fp32.onnx", "ONNX FP32"),
