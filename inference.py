@@ -9,7 +9,7 @@ from io import BytesIO
 from types import SimpleNamespace
 from torchvision import transforms
 import numpy as np
-from model import MobileCLIPRanker
+from model import MobileCLIPRanker, get_norm_stats
 
 def load_config(path="config.yml"):
     with open(path, 'r') as f:
@@ -54,13 +54,12 @@ class PropertyRanker:
         print("Model loaded successfully.\n")
         
         # 3. CRITICAL: EXACT MATCH TO TRAINING TRANSFORMS
-        # Training used: Resize -> CenterCrop -> CLIP Norm
+        norm_mean, norm_std = get_norm_stats(self.cfg.model.name)
         self.process = transforms.Compose([
             transforms.Resize(self.cfg.data.img_size, interpolation=transforms.InterpolationMode.BICUBIC),
             transforms.CenterCrop(self.cfg.data.img_size),
             transforms.ToTensor(),
-            # CLIP specific normalization (NOT ImageNet)
-            transforms.Normalize(mean=(0.481, 0.457, 0.408), std=(0.268, 0.261, 0.275))
+            transforms.Normalize(mean=norm_mean, std=norm_std)
         ])
 
     def rank(self, image_list):

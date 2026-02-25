@@ -18,7 +18,8 @@ def _remap_score(raw, label):
 
 
 class PropertyPreferenceDataset(Dataset):
-    def __init__(self, df, images_dir="images", is_train=False, img_size=224):
+    def __init__(self, df, images_dir="images", is_train=False, img_size=224,
+                 norm_mean=(0.481, 0.457, 0.408), norm_std=(0.268, 0.261, 0.275)):
         self.img_size = img_size
         self.df = df.copy()
 
@@ -30,7 +31,7 @@ class PropertyPreferenceDataset(Dataset):
             transforms.Resize(self.img_size, interpolation=transforms.InterpolationMode.BICUBIC),
             transforms.CenterCrop(self.img_size),
             transforms.ToTensor(),
-            transforms.Normalize(mean=(0.481, 0.457, 0.408), std=(0.268, 0.261, 0.275))
+            transforms.Normalize(mean=norm_mean, std=norm_std)
         ])
 
         self.groups = []

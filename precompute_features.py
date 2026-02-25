@@ -15,7 +15,7 @@ import numpy as np
 from PIL import Image
 from torchvision import transforms
 from tqdm import tqdm
-from model import MobileCLIPRanker
+from model import MobileCLIPRanker, get_norm_stats
 from utils import load_config
 
 
@@ -31,11 +31,12 @@ def extract_features(cfg):
     model = MobileCLIPRanker(cfg).to(device)
     model.eval()
 
+    norm_mean, norm_std = get_norm_stats(cfg.model.name)
     process = transforms.Compose([
         transforms.Resize(cfg.data.img_size, interpolation=transforms.InterpolationMode.BICUBIC),
         transforms.CenterCrop(cfg.data.img_size),
         transforms.ToTensor(),
-        transforms.Normalize(mean=(0.481, 0.457, 0.408), std=(0.268, 0.261, 0.275)),
+        transforms.Normalize(mean=norm_mean, std=norm_std),
     ])
 
     df = pd.read_csv(cfg.data.csv_path)
