@@ -48,6 +48,25 @@ VARIANTS = {
         "dim": 512,
         "loader": "open_clip",
     },
+    # Standard OpenCLIP ViT-B models — proper ViTs, ~4x faster than L14 on CPU
+    "vit_b16": {
+        "arch": "ViT-B-16",
+        "pretrained": "laion2b_s34b_b88k",
+        "dim": 512,
+        "loader": "open_clip_hub",
+    },
+    "vit_b32": {
+        "arch": "ViT-B-32",
+        "pretrained": "laion2b_s34b_b79k",
+        "dim": 512,
+        "loader": "open_clip_hub",
+    },
+    "vit_b16_dfn": {
+        "arch": "ViT-B-16",
+        "pretrained": "dfn2b",
+        "dim": 512,
+        "loader": "open_clip_hub",
+    },
 }
 
 
@@ -102,6 +121,10 @@ class MobileCLIPRanker(nn.Module):
             from transformers import AutoModel
             hf_model = AutoModel.from_pretrained(v["repo"])
             self.backbone = HFBackboneWrapper(hf_model)
+        elif v["loader"] == "open_clip_hub":
+            # Standard OpenCLIP models — downloads pretrained weights automatically
+            model, _, _ = open_clip.create_model_and_transforms(v["arch"], pretrained=v["pretrained"])
+            self.backbone = model.visual
         elif v["loader"] == "open_clip":
             ckpt_path = hf_hub_download(repo_id=v["repo"], filename=v["file"])
             model, _, _ = open_clip.create_model_and_transforms(v["arch"], pretrained=ckpt_path)
