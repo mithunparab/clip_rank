@@ -175,6 +175,12 @@ class MobileCLIPRanker(nn.Module):
             self.backbone = model.visual
         elif v["loader"] == "birder":
             import birder
+            from pathlib import Path
+            # Ensure birder's model cache dir exists as a directory
+            models_dir = Path("models")
+            if models_dir.exists() and not models_dir.is_dir():
+                models_dir.unlink()
+            models_dir.mkdir(parents=True, exist_ok=True)
             net, _ = birder.load_pretrained_model(v["birder_name"], inference=True)
             self.backbone = BirderBackboneWrapper(net)
         elif v["loader"] == "open_clip":
