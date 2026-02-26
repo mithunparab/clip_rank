@@ -67,6 +67,12 @@ VARIANTS = {
         "dim": 512,
         "loader": "open_clip_hub",
     },
+    # ConvNeXt — pure convolution, much faster than ViT on CPU
+    "convnext_large_22k": {
+        "repo": "facebook/convnext-large-224-22k-1k",
+        "dim": 1536,
+        "loader": "transformers",
+    },
 }
 
 
