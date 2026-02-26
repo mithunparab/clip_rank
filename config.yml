@@ -15,7 +15,7 @@ data:
 model:
   # mobileclip2_s0 | mobileclip2_s3 | mobileclip2_s4 | mobileclip2_b | mobileclip2_l14
   # vit_b16 | vit_b32 | vit_b16_dfn | convnext_large_22k | metaclip2_l14
-  name: "metaclip2_l14"
+  name: "aesthetics_l14"
   head_hidden_dim: 256
   head_dropout: 0.1
   unfreeze_last: 60

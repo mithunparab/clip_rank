@@ -12,4 +12,5 @@ timm
 open_clip_torch
 onnxruntime
 openvino
+aesthetics-predictor
 git+https://github.com/apple/ml-mobileclip.git
