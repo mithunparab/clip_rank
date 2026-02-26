@@ -85,12 +85,13 @@ VARIANTS = {
         "dim": 768,
         "loader": "transformers_clip",
     },
-    # Aesthetics predictor — CLIP ViT-L/14 fine-tuned for aesthetic scoring
+    # Aesthetics predictor V2 — uses same CLIP ViT-L/14 backbone (linearMSE
+    # only trains a head, does not fine-tune CLIP weights). Equivalent to
+    # clip_vit_l14 for our purposes.
     "aesthetics_l14": {
-        "repo": "shunk031/aesthetics-predictor-v2-sac-logos-ava1-l14-linearMSE",
-        "clip_repo": "openai/clip-vit-large-patch14",
+        "repo": "openai/clip-vit-large-patch14",
         "dim": 768,
-        "loader": "aesthetics",
+        "loader": "transformers_clip",
     },
 }
 
@@ -155,18 +156,6 @@ class MobileCLIPRanker(nn.Module):
             # Standard OpenCLIP models — downloads pretrained weights automatically
             model, _, _ = open_clip.create_model_and_transforms(v["arch"], pretrained=v["pretrained"])
             self.backbone = model.visual
-        elif v["loader"] == "aesthetics":
-            # Aesthetics predictor: load CLIP backbone + aesthetics head,
-            # extract just the CLIP vision model as our backbone
-            try:
-                from aesthetics_predictor import AestheticsPredictorV2Linear
-                aes_model = AestheticsPredictorV2Linear.from_pretrained(v["repo"])
-                self.backbone = HFBackboneWrapper(aes_model.clip.vision_model)
-            except (ImportError, AttributeError):
-                # Fallback: load the underlying CLIP vision model directly
-                from transformers import CLIPVisionModel
-                vision_model = CLIPVisionModel.from_pretrained(v["clip_repo"])
-                self.backbone = HFBackboneWrapper(vision_model)
         elif v["loader"] == "open_clip":
             ckpt_path = hf_hub_download(repo_id=v["repo"], filename=v["file"])
             model, _, _ = open_clip.create_model_and_transforms(v["arch"], pretrained=ckpt_path)
