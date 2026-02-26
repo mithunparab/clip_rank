@@ -73,6 +73,12 @@ VARIANTS = {
         "dim": 1536,
         "loader": "transformers",
     },
+    # MetaCLIP 2 — Meta's ViT-L/14 with worldwide data curation
+    "metaclip2_l14": {
+        "repo": "facebook/metaclip-2-worldwide-l14",
+        "dim": 768,
+        "loader": "transformers_clip",
+    },
 }
 
 
@@ -81,6 +87,7 @@ def get_norm_stats(model_name):
     v = VARIANTS.get(model_name.lower(), {})
     if v.get("loader") == "transformers":
         return IMAGENET_NORM
+    # CLIP and CLIP-derived models (open_clip, transformers_clip)
     return CLIP_NORM
 
 
@@ -123,7 +130,11 @@ class MobileCLIPRanker(nn.Module):
         v = VARIANTS[name]
         print(f"Initializing {name} backbone...")
 
-        if v["loader"] == "transformers":
+        if v["loader"] == "transformers_clip":
+            from transformers import CLIPVisionModel
+            vision_model = CLIPVisionModel.from_pretrained(v["repo"])
+            self.backbone = HFBackboneWrapper(vision_model)
+        elif v["loader"] == "transformers":
             from transformers import AutoModel
             hf_model = AutoModel.from_pretrained(v["repo"])
             self.backbone = HFBackboneWrapper(hf_model)
