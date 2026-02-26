@@ -93,6 +93,12 @@ VARIANTS = {
         "dim": 768,
         "loader": "transformers_clip",
     },
+    # Birder CLIP ViT-L/14 — OpenAI CLIP loaded via birder framework
+    "birder_vit_l14": {
+        "birder_name": "vit_l14_pn_quick_gelu_openai-clip",
+        "dim": 768,
+        "loader": "birder",
+    },
 }
 
 
@@ -116,6 +122,17 @@ class HFBackboneWrapper(nn.Module):
     def forward(self, x):
         outputs = self.model(pixel_values=x)
         return outputs.pooler_output
+
+
+class BirderBackboneWrapper(nn.Module):
+    """Wraps a birder model: (B, C, H, W) tensor -> (B, dim) projections."""
+
+    def __init__(self, net):
+        super().__init__()
+        self.net = net
+
+    def forward(self, x):
+        return self.net(x)
 
 
 class RankingHead(nn.Module):
@@ -156,6 +173,10 @@ class MobileCLIPRanker(nn.Module):
             # Standard OpenCLIP models — downloads pretrained weights automatically
             model, _, _ = open_clip.create_model_and_transforms(v["arch"], pretrained=v["pretrained"])
             self.backbone = model.visual
+        elif v["loader"] == "birder":
+            import birder
+            net, _ = birder.load_pretrained_model(v["birder_name"], inference=True)
+            self.backbone = BirderBackboneWrapper(net)
         elif v["loader"] == "open_clip":
             ckpt_path = hf_hub_download(repo_id=v["repo"], filename=v["file"])
             model, _, _ = open_clip.create_model_and_transforms(v["arch"], pretrained=ckpt_path)
