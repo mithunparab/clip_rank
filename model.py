@@ -99,13 +99,19 @@ VARIANTS = {
         "dim": 768,
         "loader": "birder",
     },
+    # Pixio ViT-B/16 — Facebook's MAE-based vision encoder (2B images)
+    "pixio_vitb16": {
+        "repo": "facebook/pixio-vitb16",
+        "dim": 768,
+        "loader": "pixio",
+    },
 }
 
 
 def get_norm_stats(model_name):
     """Return (mean, std) normalization tuples appropriate for the model."""
     v = VARIANTS.get(model_name.lower(), {})
-    if v.get("loader") == "transformers":
+    if v.get("loader") in ("transformers", "pixio"):
         return IMAGENET_NORM
     # CLIP and CLIP-derived models (open_clip, transformers_clip)
     return CLIP_NORM
@@ -122,6 +128,20 @@ class HFBackboneWrapper(nn.Module):
     def forward(self, x):
         outputs = self.model(pixel_values=x)
         return outputs.pooler_output
+
+
+class PixioBackboneWrapper(nn.Module):
+    """Wraps Pixio model: mean-pool over 8 class tokens -> (B, 768)."""
+
+    def __init__(self, hf_model):
+        super().__init__()
+        self.model = hf_model
+
+    def forward(self, x):
+        outputs = self.model(pixel_values=x)
+        # First 8 tokens are class tokens
+        class_tokens = outputs.last_hidden_state[:, :8, :]
+        return class_tokens.mean(dim=1)
 
 
 class BirderBackboneWrapper(nn.Module):
@@ -173,6 +193,10 @@ class MobileCLIPRanker(nn.Module):
             # Standard OpenCLIP models — downloads pretrained weights automatically
             model, _, _ = open_clip.create_model_and_transforms(v["arch"], pretrained=v["pretrained"])
             self.backbone = model.visual
+        elif v["loader"] == "pixio":
+            from transformers import AutoModel
+            hf_model = AutoModel.from_pretrained(v["repo"])
+            self.backbone = PixioBackboneWrapper(hf_model)
         elif v["loader"] == "birder":
             import birder
             from pathlib import Path
