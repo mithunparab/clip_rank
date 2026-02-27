@@ -99,10 +99,10 @@ VARIANTS = {
         "dim": 768,
         "loader": "birder",
     },
-    # Pixio ViT-B/16 — Facebook's MAE-based vision encoder (2B images)
-    "pixio_vitb16": {
-        "repo": "facebook/pixio-vitb16",
-        "dim": 768,
+    # Pixio ViT-L/16 — Facebook's MAE-based vision encoder (2B images)
+    "pixio_vitl16": {
+        "repo": "facebook/pixio-vitl16",
+        "dim": 1024,
         "loader": "pixio",
     },
 }
