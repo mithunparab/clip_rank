@@ -6,7 +6,7 @@ system:
 data:
   csv_path: "dataset.csv"
   images_dir: "images"
-  img_size: 224
+  img_size: 256
   max_images_per_group: 15
   val_fold: 0
   n_splits: 10

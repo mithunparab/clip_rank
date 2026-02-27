@@ -218,8 +218,9 @@ class MobileCLIPRanker(nn.Module):
             self.backbone = model.image_encoder
 
         # Auto-detect backbone output dim instead of trusting registry
+        img_size = getattr(cfg.data, "img_size", 224)
         with torch.no_grad():
-            dummy = torch.zeros(1, 3, 224, 224)
+            dummy = torch.zeros(1, 3, img_size, img_size)
             self.backbone_dim = self.backbone(dummy).shape[-1]
         print(f"  backbone_dim={self.backbone_dim}")
 
