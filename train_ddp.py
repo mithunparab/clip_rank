@@ -275,7 +275,6 @@ def main():
     cache_dir = getattr(cfg.data, 'cached_features_dir', 'cached_features')
 
     df = pd.read_csv(cfg.data.csv_path)
-    df['score'] = df['score'].clip(lower=0)  # clamp negatives from updated HF data
 
     unique_groups = df['group_id'].unique()
     val_groups = unique_groups[:int(len(unique_groups) * 0.1)]
