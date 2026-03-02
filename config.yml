@@ -14,10 +14,10 @@ data:
 
 model:
   # mobileclip2_s0 | mobileclip2_s3 | mobileclip2_b | mobileclip2_l14
-  name: "mobileclip2_l14"
+  name: "mobileclip2_s0"
   head_hidden_dim: 256
   head_dropout: 0.1
-  unfreeze_last: 60
+  unfreeze_last_blocks: 4
 
 train:
   batch_size: 2
