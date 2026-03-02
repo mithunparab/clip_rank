@@ -18,8 +18,7 @@ def _remap_score(raw, label):
 
 
 class PropertyPreferenceDataset(Dataset):
-    def __init__(self, df, images_dir="images", is_train=False, img_size=224,
-                 norm_mean=(0.481, 0.457, 0.408), norm_std=(0.268, 0.261, 0.275)):
+    def __init__(self, df, images_dir="images", is_train=False, img_size=224):
         self.img_size = img_size
         self.df = df.copy()
 
@@ -27,22 +26,12 @@ class PropertyPreferenceDataset(Dataset):
             self.df['file_path'] = self.df.index.map(lambda x: os.path.join(images_dir, f"{x}.jpg"))
         self.df = self.df[self.df['file_path'].apply(os.path.exists)]
 
-        if is_train:
-            self.process = transforms.Compose([
-                transforms.RandomResizedCrop(self.img_size, scale=(0.8, 1.0),
-                                             interpolation=transforms.InterpolationMode.BICUBIC),
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=norm_mean, std=norm_std),
-            ])
-        else:
-            self.process = transforms.Compose([
-                transforms.Resize(self.img_size, interpolation=transforms.InterpolationMode.BICUBIC),
-                transforms.CenterCrop(self.img_size),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=norm_mean, std=norm_std),
-            ])
+        self.process = transforms.Compose([
+            transforms.Resize(self.img_size, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.CenterCrop(self.img_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=(0.481, 0.457, 0.408), std=(0.268, 0.261, 0.275))
+        ])
 
         self.groups = []
         if not self.df.empty:
