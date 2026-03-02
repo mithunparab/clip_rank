@@ -362,7 +362,10 @@ class MobileCLIPRanker(nn.Module):
         if x.dim() == 5:
             b, g, c, h, w = x.shape
             x_flat = x.view(b * g, c, h, w)
-            features = self.backbone(x_flat)
+            # Run backbone in fp32 — non-ViT backbones (FastViT/ConvNeXt)
+            # overflow fp16 in depthwise convs and reparameterizable branches
+            with torch.amp.autocast(device_type=x.device.type, enabled=False):
+                features = self.backbone(x_flat.float())
             features = features.view(b, g, -1)
         else:
             features = x
