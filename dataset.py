@@ -27,12 +27,22 @@ class PropertyPreferenceDataset(Dataset):
             self.df['file_path'] = self.df.index.map(lambda x: os.path.join(images_dir, f"{x}.jpg"))
         self.df = self.df[self.df['file_path'].apply(os.path.exists)]
 
-        self.process = transforms.Compose([
-            transforms.Resize(self.img_size, interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.CenterCrop(self.img_size),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=norm_mean, std=norm_std)
-        ])
+        if is_train:
+            self.process = transforms.Compose([
+                transforms.RandomResizedCrop(self.img_size, scale=(0.8, 1.0),
+                                             interpolation=transforms.InterpolationMode.BICUBIC),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=norm_mean, std=norm_std),
+            ])
+        else:
+            self.process = transforms.Compose([
+                transforms.Resize(self.img_size, interpolation=transforms.InterpolationMode.BICUBIC),
+                transforms.CenterCrop(self.img_size),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=norm_mean, std=norm_std),
+            ])
 
         self.groups = []
         if not self.df.empty:
