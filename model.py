@@ -156,10 +156,11 @@ class BirderBackboneWrapper(nn.Module):
 
 
 class RankingHead(nn.Module):
-    """2-layer MLP head with dropout. More capacity than a single linear."""
+    """LayerNorm + 2-layer MLP head with dropout."""
     def __init__(self, in_dim, hidden_dim=256, dropout=0.1):
         super().__init__()
         self.net = nn.Sequential(
+            nn.LayerNorm(in_dim),
             nn.Linear(in_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -230,16 +231,40 @@ class MobileCLIPRanker(nn.Module):
 
         unfreeze = getattr(cfg.model, "unfreeze_last", 60)
         params_to_train = list(self.backbone.named_parameters())[-unfreeze:]
-        for name, param in params_to_train:
+        for pname, param in params_to_train:
             param.requires_grad = True
+
+        # Track parent modules of unfrozen params so train() can re-enable dropout
+        self._unfrozen_modules = self._find_unfrozen_modules()
 
         head_hidden = getattr(cfg.model, "head_hidden_dim", 256)
         head_dropout = getattr(cfg.model, "head_dropout", 0.1)
         self.head = RankingHead(self.backbone_dim, head_hidden, head_dropout)
 
+    def _find_unfrozen_modules(self):
+        """Find the highest-level backbone submodules containing unfrozen params."""
+        unfrozen = set()
+        for name, param in self.backbone.named_parameters():
+            if param.requires_grad:
+                # Walk up to the top-level child of backbone
+                top = name.split('.')[0]
+                child = getattr(self.backbone, top, None)
+                if child is not None and isinstance(child, nn.Module):
+                    unfrozen.add(child)
+        return list(unfrozen)
+
     def train(self, mode=True):
         super().train(mode)
+        # Keep entire backbone in eval first (frozen layers stay eval)
         self.backbone.eval()
+        if mode:
+            # Re-enable dropout in unfrozen blocks by setting them to train,
+            # then selectively put their norm layers back to eval.
+            for module in self._unfrozen_modules:
+                module.train()
+                for sub in module.modules():
+                    if isinstance(sub, (nn.LayerNorm, nn.BatchNorm2d, nn.GroupNorm)):
+                        sub.eval()
         return self
 
     def forward(self, x, valid_lens=None):
