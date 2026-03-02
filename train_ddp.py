@@ -77,12 +77,11 @@ def pairwise_margin_loss(pred_scores, gt_scores, valid_len, margin=1.0):
         logits = pred_scores[b, :n].view(-1)
         gts = gt_scores[b, :n]
 
-        # Tier: 2=gold(>=9), 1=silver(>=3), 0=neutral, -1=bad(<2.5)
-        # After (score+10)/2: orig -10→0, -7→1.5, 0→5, 7→8.5, 8→9, 10→10
+        # Tier: 2=gold(>=8), 1=silver(>=3), 0=neutral, -1=bad(<0)
         tiers = torch.zeros_like(gts, dtype=torch.float32)
-        tiers[gts < 2.5] = -1
+        tiers[gts < 0] = -1
         tiers[gts >= 3] = 1
-        tiers[gts >= 9] = 2
+        tiers[gts >= 8] = 2
 
         for i in range(n):
             for j in range(i + 1, n):
@@ -166,8 +165,8 @@ def validate(model, df_val, cfg, device, use_cached=False, cache_dir="cached_fea
             best_score = scores[best_idx]
             max_possible = max(scores)
 
-            picked_tier = 2 if best_score >= 9 else (1 if best_score >= 3 else 0)
-            max_tier = 2 if max_possible >= 9 else (1 if max_possible >= 3 else 0)
+            picked_tier = 2 if best_score >= 8 else (1 if best_score >= 3 else 0)
+            max_tier = 2 if max_possible >= 8 else (1 if max_possible >= 3 else 0)
 
             if picked_tier == max_tier:
                 strict_wins += 1
@@ -220,8 +219,8 @@ def _validate_cached(model, df_val, device, cache_dir):
             best_score = scores[best_idx]
             max_possible = max(scores)
 
-            picked_tier = 2 if best_score >= 9 else (1 if best_score >= 3 else 0)
-            max_tier = 2 if max_possible >= 9 else (1 if max_possible >= 3 else 0)
+            picked_tier = 2 if best_score >= 8 else (1 if best_score >= 3 else 0)
+            max_tier = 2 if max_possible >= 8 else (1 if max_possible >= 3 else 0)
 
             if picked_tier == max_tier:
                 strict_wins += 1

@@ -31,7 +31,7 @@ train:
   patience: 15
   # Soft-target KLD + lower backbone LR for stability
   temperature: 0.3
-  target_temperature: 2.0
+  target_temperature: 4.0
   margin_weight: 0.5
   warmup_epochs: 1
   gradient_accumulation_steps: 4
