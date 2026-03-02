@@ -20,9 +20,9 @@ model:
   unfreeze_last_blocks: 4
 
 train:
-  batch_size: 2
-  lr_head: 0.001
-  lr_backbone: 0.000001
+  batch_size: 8
+  lr_head: 0.003
+  lr_backbone: 0.0001
   epochs: 15
   weight_decay: 0.01
   grad_clip: 1.0
