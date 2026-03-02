@@ -77,12 +77,12 @@ def pairwise_margin_loss(pred_scores, gt_scores, valid_len, margin=1.0):
         logits = pred_scores[b, :n].view(-1)
         gts = gt_scores[b, :n]
 
-        # Tier: 2=gold(>=8), 1=silver(>=3), 0=neutral(2.5-3), -1=bad(<2.5)
-        # After (score+10)/2 mapping: orig -10→0, -7→1.5, 0→5, 8→9, 10→10
+        # Tier: 2=gold(>=9), 1=silver(>=3), 0=neutral, -1=bad(<2.5)
+        # After (score+10)/2: orig -10→0, -7→1.5, 0→5, 7→8.5, 8→9, 10→10
         tiers = torch.zeros_like(gts, dtype=torch.float32)
         tiers[gts < 2.5] = -1
         tiers[gts >= 3] = 1
-        tiers[gts >= 8] = 2
+        tiers[gts >= 9] = 2
 
         for i in range(n):
             for j in range(i + 1, n):
@@ -166,8 +166,8 @@ def validate(model, df_val, cfg, device, use_cached=False, cache_dir="cached_fea
             best_score = scores[best_idx]
             max_possible = max(scores)
 
-            picked_tier = 2 if best_score >= 8 else (1 if best_score >= 3 else 0)
-            max_tier = 2 if max_possible >= 8 else (1 if max_possible >= 3 else 0)
+            picked_tier = 2 if best_score >= 9 else (1 if best_score >= 3 else 0)
+            max_tier = 2 if max_possible >= 9 else (1 if max_possible >= 3 else 0)
 
             if picked_tier == max_tier:
                 strict_wins += 1
@@ -220,8 +220,8 @@ def _validate_cached(model, df_val, device, cache_dir):
             best_score = scores[best_idx]
             max_possible = max(scores)
 
-            picked_tier = 2 if best_score >= 8 else (1 if best_score >= 3 else 0)
-            max_tier = 2 if max_possible >= 8 else (1 if max_possible >= 3 else 0)
+            picked_tier = 2 if best_score >= 9 else (1 if best_score >= 3 else 0)
+            max_tier = 2 if max_possible >= 9 else (1 if max_possible >= 3 else 0)
 
             if picked_tier == max_tier:
                 strict_wins += 1
@@ -277,7 +277,6 @@ def main():
     cache_dir = getattr(cfg.data, 'cached_features_dir', 'cached_features')
 
     df = pd.read_csv(cfg.data.csv_path)
-    df['score'] = (df['score'] + 10) / 2  # map [-10,10] → [0,10]
 
     unique_groups = df['group_id'].unique()
     val_groups = unique_groups[:int(len(unique_groups) * 0.1)]

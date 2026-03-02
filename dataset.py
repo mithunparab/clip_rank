@@ -7,14 +7,15 @@ import pandas as pd
 
 
 def _remap_score(raw, label):
-    """Apply label-based score remapping."""
+    """Apply label-based score remapping, then normalize [-10,10] → [0,10]."""
     lbl = str(label).lower()
     if raw >= 8:
         if lbl in ['outdoor', 'bathroom', 'other', 'balcony']:
             return 0.0
         if lbl == 'bedroom':
             return 3.0
-    return raw
+    # Normalize: scores may be in [-10,10] from verified data
+    return (raw + 10) / 2
 
 
 class PropertyPreferenceDataset(Dataset):
