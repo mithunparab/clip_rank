@@ -276,6 +276,7 @@ def main():
     cache_dir = getattr(cfg.data, 'cached_features_dir', 'cached_features')
 
     df = pd.read_csv(cfg.data.csv_path)
+    df['score'] = (df['score'] + 10) / 2  # map [-10,10] → [0,10]
 
     unique_groups = df['group_id'].unique()
     val_groups = unique_groups[:int(len(unique_groups) * 0.1)]
