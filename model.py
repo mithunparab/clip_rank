@@ -155,68 +155,6 @@ class BirderBackboneWrapper(nn.Module):
         return self.net(x)
 
 
-def _detect_blocks(module):
-    """Auto-detect repeating blocks in any backbone architecture.
-
-    Walks the module tree and finds homogeneous nn.ModuleList/Sequential
-    containers (all children same type, len >= 2).  For single-stream
-    architectures (ViT) there is one such container; for multi-stage
-    architectures (FastViT, ConvNeXt) there are several at the same depth.
-    In the multi-stage case we flatten blocks across stages so that
-    "last N blocks" means the final blocks of the final stage.
-
-    Returns (description, blocks_list, block_type) or None.
-    ``blocks_list`` is a plain Python list of nn.Module — not a container.
-    """
-    from collections import defaultdict
-
-    candidates = []  # (depth, path, container, child_type)
-
-    def _walk(mod, path, depth):
-        if isinstance(mod, (nn.ModuleList, nn.Sequential)) and len(mod) >= 2:
-            child_types = [type(c) for c in mod]
-            if len(set(child_types)) == 1:
-                candidates.append((depth, path, mod, child_types[0]))
-        for name, child in mod.named_children():
-            _walk(child, f"{path}.{name}" if path else name, depth + 1)
-
-    _walk(module, "", 0)
-    if not candidates:
-        return None
-
-    max_depth = max(c[0] for c in candidates)
-    deepest = [c for c in candidates if c[0] == max_depth]
-
-    if len(deepest) == 1:
-        # Single container at max depth — ViT-like
-        _, attr_path, container, block_type = deepest[0]
-        return attr_path, list(container), block_type
-
-    # Multiple containers at max depth — multi-stage architecture.
-    # Group by child type and pick the type with the most total blocks.
-    by_type = defaultdict(list)
-    for _, path, container, ctype in deepest:
-        by_type[ctype].append((path, container))
-
-    best_type = max(by_type, key=lambda t: sum(len(c) for _, c in by_type[t]))
-    groups = by_type[best_type]
-
-    if len(groups) == 1:
-        path, container = groups[0]
-        return path, list(container), best_type
-
-    # Flatten blocks across stages in DFS order (stage 0 first … stage N last)
-    all_blocks = []
-    stage_info = []
-    for path, container in groups:
-        n = len(container)
-        all_blocks.extend(container)
-        stage_info.append(f"{path}({n})")
-
-    desc = " → ".join(stage_info)
-    return desc, all_blocks, best_type
-
-
 class RankingHead(nn.Module):
     """LayerNorm + 2-layer MLP head with dropout."""
     def __init__(self, in_dim, hidden_dim=256, dropout=0.1):
@@ -291,41 +229,13 @@ class MobileCLIPRanker(nn.Module):
         for param in self.backbone.parameters():
             param.requires_grad = False
 
-        unfreeze_blocks = getattr(cfg.model, "unfreeze_last_blocks", None)
-        unfreeze_params = getattr(cfg.model, "unfreeze_last", None)
+        unfreeze = getattr(cfg.model, "unfreeze_last", 60)
+        params_to_train = list(self.backbone.named_parameters())[-unfreeze:]
+        for pname, param in params_to_train:
+            param.requires_grad = True
 
-        if unfreeze_blocks is not None:
-            # Block-based unfreezing: auto-detect repeating blocks
-            detection = _detect_blocks(self.backbone)
-            if detection is not None:
-                desc, blocks, block_type = detection
-                total_blocks = len(blocks)
-                n = min(unfreeze_blocks, total_blocks)
-                unfrozen_blocks = blocks[-n:]
-                # Unfreeze the last n blocks (end of network)
-                for block in unfrozen_blocks:
-                    for param in block.parameters():
-                        param.requires_grad = True
-                n_unfrozen = sum(1 for p in self.backbone.parameters() if p.requires_grad)
-                print(f"  Block-based unfreeze: {n}/{total_blocks} blocks "
-                      f"[{desc}] ({block_type.__name__}), "
-                      f"{n_unfrozen} params unfrozen")
-                # Use the actual unfrozen blocks for train() mode — NOT
-                # top-level children which would put entire trunk in train mode
-                self._unfrozen_modules = unfrozen_blocks
-            else:
-                # Block detection failed — fall back to param count
-                fallback = unfreeze_params if unfreeze_params is not None else 60
-                print(f"  Block detection failed, falling back to last {fallback} params")
-                for _, param in list(self.backbone.named_parameters())[-fallback:]:
-                    param.requires_grad = True
-                self._unfrozen_modules = self._find_unfrozen_modules()
-        else:
-            # Legacy: unfreeze last N parameters by count
-            unfreeze = unfreeze_params if unfreeze_params is not None else 60
-            for _, param in list(self.backbone.named_parameters())[-unfreeze:]:
-                param.requires_grad = True
-            self._unfrozen_modules = self._find_unfrozen_modules()
+        # Track parent modules of unfrozen params so train() can re-enable dropout
+        self._unfrozen_modules = self._find_unfrozen_modules()
 
         head_hidden = getattr(cfg.model, "head_hidden_dim", 256)
         head_dropout = getattr(cfg.model, "head_dropout", 0.1)
@@ -362,10 +272,7 @@ class MobileCLIPRanker(nn.Module):
         if x.dim() == 5:
             b, g, c, h, w = x.shape
             x_flat = x.view(b * g, c, h, w)
-            # Run backbone in fp32 — non-ViT backbones (FastViT/ConvNeXt)
-            # overflow fp16 in depthwise convs and reparameterizable branches
-            with torch.amp.autocast(device_type=x.device.type, enabled=False):
-                features = self.backbone(x_flat.float())
+            features = self.backbone(x_flat)
             features = features.view(b, g, -1)
         else:
             features = x
