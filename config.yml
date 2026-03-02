@@ -6,16 +6,15 @@ system:
 data:
   csv_path: "dataset.csv"
   images_dir: "images"
-  img_size: 256
+  img_size: 224
   max_images_per_group: 15
   val_fold: 0
   n_splits: 10
   cached_features_dir: "cached_features"
 
 model:
-  # mobileclip2_s0 | mobileclip2_s3 | mobileclip2_s4 | mobileclip2_b | mobileclip2_l14
-  # vit_b16 | vit_b32 | vit_b16_dfn | convnext_large_22k | metaclip2_l14
-  name: "pixio_vitl16"
+  # mobileclip2_s0 | mobileclip2_s3 | mobileclip2_b | mobileclip2_l14
+  name: "mobileclip2_l14"
   head_hidden_dim: 256
   head_dropout: 0.1
   unfreeze_last: 60
@@ -24,20 +23,16 @@ train:
   batch_size: 2
   lr_head: 0.001
   lr_backbone: 0.000001
-  epochs: 10
+  epochs: 15
   weight_decay: 0.01
   grad_clip: 1.0
   seed: 42
   save_dir: "checkpoints"
   patience: 15
+  # Soft-target KLD + lower backbone LR for stability
   temperature: 0.3
   target_temperature: 2.0
   margin_weight: 0.5
   warmup_epochs: 1
   gradient_accumulation_steps: 4
   use_cached_features: false
-
-cache:
-  embeddings_dir: "cached_embeddings"
-  # Precompute: python precompute_embeddings.py
-  # Inference:  python inference_cached.py --validate
