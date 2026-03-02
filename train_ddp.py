@@ -12,7 +12,7 @@ import pandas as pd
 import numpy as np
 from tqdm import tqdm
 from dataset import PropertyPreferenceDataset, CachedFeatureDataset, _remap_score
-from model import MobileCLIPRanker, get_norm_stats
+from model import MobileCLIPRanker
 from utils import load_config
 
 
@@ -120,8 +120,7 @@ def compute_ndcg(pred_scores, gt_scores):
     return dcg / idcg
 
 
-def validate(model, df_val, cfg, device, use_cached=False, cache_dir="cached_features",
-             norm_mean=(0.481, 0.457, 0.408), norm_std=(0.268, 0.261, 0.275)):
+def validate(model, df_val, cfg, device, use_cached=False, cache_dir="cached_features"):
     model.eval()
 
     if use_cached:
@@ -129,8 +128,7 @@ def validate(model, df_val, cfg, device, use_cached=False, cache_dir="cached_fea
 
     ds = PropertyPreferenceDataset(
         pd.DataFrame({'group_id': [], 'score': [], 'label': []}),
-        images_dir="images", is_train=False, img_size=cfg.data.img_size,
-        norm_mean=norm_mean, norm_std=norm_std
+        images_dir="images", is_train=False, img_size=cfg.data.img_size
     )
     if 'file_path' not in df_val.columns:
         df_val = df_val.copy()
@@ -283,8 +281,6 @@ def main():
     train_df = df[~df['group_id'].isin(val_groups)]
     val_df = df[df['group_id'].isin(val_groups)]
 
-    norm_mean, norm_std = get_norm_stats(cfg.model.name)
-
     if use_cached:
         if not os.path.isdir(cache_dir):
             print(f"ERROR: Cache dir '{cache_dir}' not found. Run precompute_features.py first.")
@@ -292,10 +288,7 @@ def main():
         train_ds = CachedFeatureDataset(train_df, cache_dir=cache_dir)
         print(f"Using cached features from {cache_dir}/")
     else:
-        train_ds = PropertyPreferenceDataset(
-            train_df, images_dir="images", is_train=True, img_size=cfg.data.img_size,
-            norm_mean=norm_mean, norm_std=norm_std
-        )
+        train_ds = PropertyPreferenceDataset(train_df, images_dir="images", is_train=True, img_size=cfg.data.img_size)
 
     sampler = DistributedSampler(train_ds, shuffle=True, seed=seed) if dist.is_initialized() else None
 
@@ -404,8 +397,7 @@ def main():
         if rank == 0:
             avg_loss = total_loss / len(train_loader)
             raw_val = model.module if hasattr(model, 'module') else model
-            acc, ndcg = validate(raw_val, val_df, cfg, device, use_cached=use_cached, cache_dir=cache_dir,
-                                norm_mean=norm_mean, norm_std=norm_std)
+            acc, ndcg = validate(raw_val, val_df, cfg, device, use_cached=use_cached, cache_dir=cache_dir)
 
             current_lr = optimizer.param_groups[0]['lr']
             print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Acc: {acc:.2%} | NDCG: {ndcg:.4f} | LR: {current_lr:.2e}")
