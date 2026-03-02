@@ -276,19 +276,6 @@ def main():
 
     df = pd.read_csv(cfg.data.csv_path)
 
-    # Merge human-verified scores if available
-    verif_path = getattr(cfg.data, 'verifications_path', 'verifications.csv')
-    if os.path.exists(verif_path):
-        vdf = pd.read_csv(verif_path)
-        lookup = {(r['group_id'], r['url']): float(r['corrected_score'])
-                  for _, r in vdf.iterrows()}
-        before = df['score'].copy()
-        df['score'] = df.apply(
-            lambda r: lookup.get((r['group_id'], r['url']), r['score']), axis=1)
-        changed = (df['score'] != before).sum()
-        if rank == 0:
-            print(f"Verifications: {len(lookup)} verified, {changed} scores updated")
-
     unique_groups = df['group_id'].unique()
     val_groups = unique_groups[:int(len(unique_groups) * 0.1)]
     train_df = df[~df['group_id'].isin(val_groups)]
