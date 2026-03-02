@@ -156,33 +156,65 @@ class BirderBackboneWrapper(nn.Module):
 
 
 def _detect_blocks(module):
-    """Walk the module tree and find the deepest nn.ModuleList or nn.Sequential
-    whose children are all the same type (len >= 2).  This catches:
-      - ViT:       transformer.resblocks  (nn.Sequential of ResidualAttentionBlock)
-      - HF CLIP:   encoder.layers         (nn.ModuleList of CLIPEncoderLayer)
-      - FastViT:   stage blocks           (nn.Sequential of RepMixerBlock)
-      - ConvNeXt:  stages/layers          (nn.Sequential of ConvNeXtLayer)
+    """Auto-detect repeating blocks in any backbone architecture.
 
-    Returns (parent_attr_path, container, block_type) or None.
+    Walks the module tree and finds homogeneous nn.ModuleList/Sequential
+    containers (all children same type, len >= 2).  For single-stream
+    architectures (ViT) there is one such container; for multi-stage
+    architectures (FastViT, ConvNeXt) there are several at the same depth.
+    In the multi-stage case we flatten blocks across stages so that
+    "last N blocks" means the final blocks of the final stage.
+
+    Returns (description, blocks_list, block_type) or None.
+    ``blocks_list`` is a plain Python list of nn.Module — not a container.
     """
-    best = None  # (depth, attr_path, container)
+    from collections import defaultdict
+
+    candidates = []  # (depth, path, container, child_type)
 
     def _walk(mod, path, depth):
-        nonlocal best
         if isinstance(mod, (nn.ModuleList, nn.Sequential)) and len(mod) >= 2:
             child_types = [type(c) for c in mod]
             if len(set(child_types)) == 1:
-                if best is None or depth > best[0]:
-                    best = (depth, path, mod)
+                candidates.append((depth, path, mod, child_types[0]))
         for name, child in mod.named_children():
             _walk(child, f"{path}.{name}" if path else name, depth + 1)
 
     _walk(module, "", 0)
-    if best is None:
+    if not candidates:
         return None
-    _, attr_path, container = best
-    block_type = type(list(container.children())[0])
-    return attr_path, container, block_type
+
+    max_depth = max(c[0] for c in candidates)
+    deepest = [c for c in candidates if c[0] == max_depth]
+
+    if len(deepest) == 1:
+        # Single container at max depth — ViT-like
+        _, attr_path, container, block_type = deepest[0]
+        return attr_path, list(container), block_type
+
+    # Multiple containers at max depth — multi-stage architecture.
+    # Group by child type and pick the type with the most total blocks.
+    by_type = defaultdict(list)
+    for _, path, container, ctype in deepest:
+        by_type[ctype].append((path, container))
+
+    best_type = max(by_type, key=lambda t: sum(len(c) for _, c in by_type[t]))
+    groups = by_type[best_type]
+
+    if len(groups) == 1:
+        path, container = groups[0]
+        return path, list(container), best_type
+
+    # Flatten blocks across stages in DFS order (stage 0 first … stage N last)
+    all_blocks = []
+    stage_info = []
+    for path, container in groups:
+        n = len(container)
+        all_blocks.extend(container)
+        stage_info.append(f"{path}({n})")
+
+    desc = " → ".join(stage_info)
+    return desc, all_blocks, best_type
 
 
 class RankingHead(nn.Module):
@@ -266,16 +298,16 @@ class MobileCLIPRanker(nn.Module):
             # Block-based unfreezing: auto-detect repeating blocks
             detection = _detect_blocks(self.backbone)
             if detection is not None:
-                attr_path, container, block_type = detection
-                total_blocks = len(container)
+                desc, blocks, block_type = detection
+                total_blocks = len(blocks)
                 n = min(unfreeze_blocks, total_blocks)
-                # Unfreeze the last n blocks
-                for block in list(container)[-n:]:
+                # Unfreeze the last n blocks (end of network)
+                for block in blocks[-n:]:
                     for param in block.parameters():
                         param.requires_grad = True
                 n_unfrozen = sum(1 for p in self.backbone.parameters() if p.requires_grad)
                 print(f"  Block-based unfreeze: {n}/{total_blocks} blocks "
-                      f"at '{attr_path}' ({block_type.__name__}), "
+                      f"[{desc}] ({block_type.__name__}), "
                       f"{n_unfrozen} params unfrozen")
             else:
                 # Block detection failed — fall back to param count
