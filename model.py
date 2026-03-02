@@ -155,6 +155,36 @@ class BirderBackboneWrapper(nn.Module):
         return self.net(x)
 
 
+def _detect_blocks(module):
+    """Walk the module tree and find the deepest nn.ModuleList or nn.Sequential
+    whose children are all the same type (len >= 2).  This catches:
+      - ViT:       transformer.resblocks  (nn.Sequential of ResidualAttentionBlock)
+      - HF CLIP:   encoder.layers         (nn.ModuleList of CLIPEncoderLayer)
+      - FastViT:   stage blocks           (nn.Sequential of RepMixerBlock)
+      - ConvNeXt:  stages/layers          (nn.Sequential of ConvNeXtLayer)
+
+    Returns (parent_attr_path, container, block_type) or None.
+    """
+    best = None  # (depth, attr_path, container)
+
+    def _walk(mod, path, depth):
+        nonlocal best
+        if isinstance(mod, (nn.ModuleList, nn.Sequential)) and len(mod) >= 2:
+            child_types = [type(c) for c in mod]
+            if len(set(child_types)) == 1:
+                if best is None or depth > best[0]:
+                    best = (depth, path, mod)
+        for name, child in mod.named_children():
+            _walk(child, f"{path}.{name}" if path else name, depth + 1)
+
+    _walk(module, "", 0)
+    if best is None:
+        return None
+    _, attr_path, container = best
+    block_type = type(list(container.children())[0])
+    return attr_path, container, block_type
+
+
 class RankingHead(nn.Module):
     """LayerNorm + 2-layer MLP head with dropout."""
     def __init__(self, in_dim, hidden_dim=256, dropout=0.1):
@@ -229,10 +259,35 @@ class MobileCLIPRanker(nn.Module):
         for param in self.backbone.parameters():
             param.requires_grad = False
 
-        unfreeze = getattr(cfg.model, "unfreeze_last", 60)
-        params_to_train = list(self.backbone.named_parameters())[-unfreeze:]
-        for pname, param in params_to_train:
-            param.requires_grad = True
+        unfreeze_blocks = getattr(cfg.model, "unfreeze_last_blocks", None)
+        unfreeze_params = getattr(cfg.model, "unfreeze_last", None)
+
+        if unfreeze_blocks is not None:
+            # Block-based unfreezing: auto-detect repeating blocks
+            detection = _detect_blocks(self.backbone)
+            if detection is not None:
+                attr_path, container, block_type = detection
+                total_blocks = len(container)
+                n = min(unfreeze_blocks, total_blocks)
+                # Unfreeze the last n blocks
+                for block in list(container)[-n:]:
+                    for param in block.parameters():
+                        param.requires_grad = True
+                n_unfrozen = sum(1 for p in self.backbone.parameters() if p.requires_grad)
+                print(f"  Block-based unfreeze: {n}/{total_blocks} blocks "
+                      f"at '{attr_path}' ({block_type.__name__}), "
+                      f"{n_unfrozen} params unfrozen")
+            else:
+                # Block detection failed — fall back to param count
+                fallback = unfreeze_params if unfreeze_params is not None else 60
+                print(f"  Block detection failed, falling back to last {fallback} params")
+                for _, param in list(self.backbone.named_parameters())[-fallback:]:
+                    param.requires_grad = True
+        else:
+            # Legacy: unfreeze last N parameters by count
+            unfreeze = unfreeze_params if unfreeze_params is not None else 60
+            for _, param in list(self.backbone.named_parameters())[-unfreeze:]:
+                param.requires_grad = True
 
         # Track parent modules of unfrozen params so train() can re-enable dropout
         self._unfrozen_modules = self._find_unfrozen_modules()
