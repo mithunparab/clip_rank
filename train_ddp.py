@@ -77,9 +77,8 @@ def pairwise_margin_loss(pred_scores, gt_scores, valid_len, margin=1.0):
         logits = pred_scores[b, :n].view(-1)
         gts = gt_scores[b, :n]
 
-        # Tier: 2=gold(>=8), 1=silver(>=3), 0=neutral, -1=bad(<0)
+        # Tier: 2=gold(>=8), 1=silver(>=3), 0=rest
         tiers = torch.zeros_like(gts, dtype=torch.float32)
-        tiers[gts < 0] = -1
         tiers[gts >= 3] = 1
         tiers[gts >= 8] = 2
 
@@ -276,6 +275,7 @@ def main():
     cache_dir = getattr(cfg.data, 'cached_features_dir', 'cached_features')
 
     df = pd.read_csv(cfg.data.csv_path)
+    df['score'] = df['score'].clip(lower=0)
 
     unique_groups = df['group_id'].unique()
     val_groups = unique_groups[:int(len(unique_groups) * 0.1)]
