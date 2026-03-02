@@ -77,9 +77,10 @@ def pairwise_margin_loss(pred_scores, gt_scores, valid_len, margin=1.0):
         logits = pred_scores[b, :n].view(-1)
         gts = gt_scores[b, :n]
 
-        # Tier: 2=gold(>=8), 1=silver(>=3), 0=neutral, -1=bad(<0)
+        # Tier: 2=gold(>=8), 1=silver(>=3), 0=neutral(2.5-3), -1=bad(<2.5)
+        # After (score+10)/2 mapping: orig -10→0, -7→1.5, 0→5, 8→9, 10→10
         tiers = torch.zeros_like(gts, dtype=torch.float32)
-        tiers[gts < 0] = -1
+        tiers[gts < 2.5] = -1
         tiers[gts >= 3] = 1
         tiers[gts >= 8] = 2
 
