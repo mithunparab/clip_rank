@@ -393,8 +393,8 @@ def main():
             current_lr = optimizer.param_groups[0]['lr']
             print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Top1: {top1:.2%} | Spearman: {spearman:.4f} | NDCG: {ndcg:.4f} | LR: {current_lr:.2e}")
 
-            if spearman > best_acc:
-                best_acc = spearman
+            if top1 > best_acc:
+                best_acc = top1
                 patience_counter = 0
                 save_checkpoint(model, optimizer, epoch + 1, f"{cfg.train.save_dir}/last.pth", is_best=True)
             else:
@@ -402,7 +402,7 @@ def main():
                 save_checkpoint(model, optimizer, epoch + 1, f"{cfg.train.save_dir}/last.pth", is_best=False)
 
             if patience_counter >= patience:
-                print(f"Early stopping. Best Spearman: {best_acc:.4f}")
+                print(f"Early stopping. Best Top1: {best_acc:.2%}")
                 break
 
     cleanup_ddp()
