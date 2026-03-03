@@ -34,6 +34,18 @@ def merge_with_verifications(annotations_path, verifications_path):
 
     ver = pd.read_csv(verifications_path)
     print(f"Loaded {len(ver)} verification records to apply as overrides.")
+    print(f"verifications.csv columns: {list(ver.columns)}")
+
+    # Auto-detect score column
+    score_col_candidates = ['score', 'corrected_score', 'verified_score', 'new_score', 'final_score']
+    score_col = next((c for c in score_col_candidates if c in ver.columns), None)
+    if score_col is None:
+        raise ValueError(f"Cannot find score column in verifications.csv. Columns: {list(ver.columns)}")
+    if score_col != 'score':
+        print(f"Using '{score_col}' as the score column from verifications.csv")
+
+    label_col_candidates = ['label', 'corrected_label', 'verified_label', 'new_label']
+    label_col = next((c for c in label_col_candidates if c in ver.columns), None)
 
     # Index annotations by url for fast lookup
     df = df.set_index('url')
@@ -41,9 +53,9 @@ def merge_with_verifications(annotations_path, verifications_path):
     for _, row in ver.iterrows():
         url = row['url']
         if url in df.index:
-            df.at[url, 'score'] = row['score']
-            if 'label' in row and pd.notna(row.get('label')):
-                df.at[url, 'label'] = row['label']
+            df.at[url, 'score'] = row[score_col]
+            if label_col and pd.notna(row.get(label_col)):
+                df.at[url, 'label'] = row[label_col]
         else:
             # URL only in verifications: add as new row
             new_row = row.reindex(df.columns)
