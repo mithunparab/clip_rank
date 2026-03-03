@@ -17,7 +17,7 @@ model:
   name: "mobileclip2_l14"
   head_hidden_dim: 256
   head_dropout: 0.1
-  unfreeze_last: 120
+  unfreeze_last: 200
 
 train:
   batch_size: 2
@@ -29,7 +29,6 @@ train:
   seed: 42
   save_dir: "checkpoints"
   patience: 20
-  min_score_gap: 7.0
   # Soft-target KLD + lower backbone LR for stability
   temperature: 0.3
   target_temperature: 2.0
