@@ -27,7 +27,9 @@ def build_dataset(annotations_path, verifications_path):
     Join with original annotations to recover `label` where verifications lack it.
     Falls back to annotations alone if verifications.csv is missing.
     """
-    ann = pd.read_csv(annotations_path)
+    # Always read labels from annotations.csv — never the overwritten dataset.csv
+    ann_label_path = 'annotations.csv'
+    ann = pd.read_csv(ann_label_path if os.path.exists(ann_label_path) else annotations_path)
 
     if not os.path.exists(verifications_path):
         print(f"No verifications file found — using annotations only.")
@@ -58,7 +60,7 @@ def main():
     if not os.path.exists('images'):
         os.makedirs('images')
 
-    df = build_dataset('dataset.csv', 'verifications.csv')
+    df = build_dataset('annotations.csv', 'verifications.csv')
 
     # Save merged result back so training uses corrected scores
     df.to_csv('dataset.csv', index=False)
