@@ -21,48 +21,36 @@ def download_one(row):
         pass
 
 
-def merge_with_verifications(annotations_path, verifications_path):
+def build_dataset(annotations_path, verifications_path):
     """
-    Load annotations and apply corrected values from verifications.
-    Verifications override score (and label if present) for matching URLs.
+    Use verifications.csv as the primary dataset (human-reviewed, [-10, 10] scale).
+    Join with original annotations to recover `label` where verifications lack it.
+    Falls back to annotations alone if verifications.csv is missing.
     """
-    df = pd.read_csv(annotations_path)
+    ann = pd.read_csv(annotations_path)
 
     if not os.path.exists(verifications_path):
-        print(f"No verifications file found at '{verifications_path}', using annotations only.")
-        return df
+        print(f"No verifications file found — using annotations only.")
+        return ann
 
     ver = pd.read_csv(verifications_path)
-    print(f"Loaded {len(ver)} verification records to apply as overrides.")
+    print(f"verifications.csv: {len(ver)} rows, {ver['group_id'].nunique()} groups")
     print(f"verifications.csv columns: {list(ver.columns)}")
 
-    # Auto-detect score column
-    score_col_candidates = ['score', 'corrected_score', 'verified_score', 'new_score', 'final_score']
-    score_col = next((c for c in score_col_candidates if c in ver.columns), None)
-    if score_col is None:
-        raise ValueError(f"Cannot find score column in verifications.csv. Columns: {list(ver.columns)}")
-    if score_col != 'score':
-        print(f"Using '{score_col}' as the score column from verifications.csv")
+    # verifications uses corrected_score ([-10, 10] scale) — rename to 'score'
+    ver = ver.rename(columns={'corrected_score': 'score'})
 
-    label_col_candidates = ['label', 'corrected_label', 'verified_label', 'new_label']
-    label_col = next((c for c in label_col_candidates if c in ver.columns), None)
+    # Pull labels from original annotations since verifications.corrected_label is all NaN
+    url_to_label = ann.set_index('url')['label'].dropna()
+    ver['label'] = ver['url'].map(url_to_label)
 
-    # Index annotations by url for fast lookup
-    df = df.set_index('url')
+    df = ver[['url', 'group_id', 'score', 'label']].copy()
 
-    for _, row in ver.iterrows():
-        url = row['url']
-        if url in df.index:
-            df.at[url, 'score'] = row[score_col]
-            if label_col and pd.notna(row.get(label_col)):
-                df.at[url, 'label'] = row[label_col]
-        else:
-            # URL only in verifications: add as new row
-            new_row = row.reindex(df.columns)
-            df.loc[url] = new_row
+    score_counts = df['score'].value_counts().sort_index()
+    print(f"Score distribution:\n{score_counts.to_string()}")
+    print(f"Label NaN: {df['label'].isna().sum()} / {len(df)}")
+    print(f"Total: {len(df)} rows, {df['group_id'].nunique()} groups")
 
-    df = df.reset_index()
-    print(f"Merged dataset: {len(df)} total records.")
     return df
 
 
@@ -70,7 +58,7 @@ def main():
     if not os.path.exists('images'):
         os.makedirs('images')
 
-    df = merge_with_verifications('dataset.csv', 'verifications.csv')
+    df = build_dataset('dataset.csv', 'verifications.csv')
 
     # Save merged result back so training uses corrected scores
     df.to_csv('dataset.csv', index=False)
