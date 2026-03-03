@@ -13,7 +13,7 @@ def _remap_score(raw, label):
 
 
 class PropertyPreferenceDataset(Dataset):
-    def __init__(self, df, images_dir="images", is_train=False, img_size=224):
+    def __init__(self, df, images_dir="images", is_train=False, img_size=224, min_score_gap=7.0):
         self.img_size = img_size
         self.df = df.copy()
 
@@ -29,12 +29,20 @@ class PropertyPreferenceDataset(Dataset):
         ])
 
         self.groups = []
+        skipped = 0
         if not self.df.empty:
             grouped = self.df.groupby('group_id')
             for _, group in grouped:
                 if len(group) < 2:
                     continue
+                if is_train and min_score_gap > 0:
+                    scores = group['score'].astype(float)
+                    if scores.max() - scores.min() < min_score_gap:
+                        skipped += 1
+                        continue
                 self.groups.append(group.to_dict('records'))
+        if is_train and skipped:
+            print(f"Skipped {skipped} near-tie training groups (gap < {min_score_gap})")
 
     def _process(self, path):
         try:

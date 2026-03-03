@@ -312,7 +312,8 @@ def main():
         train_ds = CachedFeatureDataset(train_df, cache_dir=cache_dir)
         print(f"Using cached features from {cache_dir}/")
     else:
-        train_ds = PropertyPreferenceDataset(train_df, images_dir="images", is_train=True, img_size=cfg.data.img_size)
+        min_score_gap = getattr(cfg.train, 'min_score_gap', 7.0)
+        train_ds = PropertyPreferenceDataset(train_df, images_dir="images", is_train=True, img_size=cfg.data.img_size, min_score_gap=min_score_gap)
 
     sampler = DistributedSampler(train_ds, shuffle=True, seed=seed) if dist.is_initialized() else None
 
