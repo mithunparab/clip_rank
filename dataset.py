@@ -12,8 +12,11 @@ def _remap_score(raw, label):
     return float(raw)
 
 
+GOLD_THRESHOLD = 7.0  # scores in [-10, 10]; gold = 7-10
+
+
 class PropertyPreferenceDataset(Dataset):
-    def __init__(self, df, images_dir="images", is_train=False, img_size=224, min_score_gap=7.0):
+    def __init__(self, df, images_dir="images", is_train=False, img_size=224):
         self.img_size = img_size
         self.df = df.copy()
 
@@ -21,12 +24,23 @@ class PropertyPreferenceDataset(Dataset):
             self.df['file_path'] = self.df.index.map(lambda x: os.path.join(images_dir, f"{x}.jpg"))
         self.df = self.df[self.df['file_path'].apply(os.path.exists)]
 
-        self.process = transforms.Compose([
-            transforms.Resize(self.img_size, interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.CenterCrop(self.img_size),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=(0.481, 0.457, 0.408), std=(0.268, 0.261, 0.275))
-        ])
+        # Training augmentation; validation uses deterministic center crop
+        if is_train:
+            self.process = transforms.Compose([
+                transforms.RandomResizedCrop(img_size, scale=(0.8, 1.0),
+                                             interpolation=transforms.InterpolationMode.BICUBIC),
+                transforms.RandomHorizontalFlip(),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=(0.481, 0.457, 0.408), std=(0.268, 0.261, 0.275))
+            ])
+        else:
+            self.process = transforms.Compose([
+                transforms.Resize(img_size, interpolation=transforms.InterpolationMode.BICUBIC),
+                transforms.CenterCrop(img_size),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=(0.481, 0.457, 0.408), std=(0.268, 0.261, 0.275))
+            ])
 
         self.groups = []
         skipped = 0
@@ -35,14 +49,15 @@ class PropertyPreferenceDataset(Dataset):
             for _, group in grouped:
                 if len(group) < 2:
                     continue
-                if is_train and min_score_gap > 0:
-                    scores = group['score'].astype(float)
-                    if scores.max() - scores.min() < min_score_gap:
+                if is_train:
+                    # Only train on groups that have at least one gold image —
+                    # aligned with gold accuracy metric; skips bronze/silver-only noise
+                    if group['score'].astype(float).max() < GOLD_THRESHOLD:
                         skipped += 1
                         continue
                 self.groups.append(group.to_dict('records'))
         if is_train and skipped:
-            print(f"Skipped {skipped} near-tie training groups (gap < {min_score_gap})")
+            print(f"Skipped {skipped} groups with no gold image (max score < {GOLD_THRESHOLD})")
 
     def _process(self, path):
         try:
