@@ -61,6 +61,38 @@ def listwise_kl_loss(pred_scores, gt_scores, valid_len, temperature=1.0, target_
     return pred_scores.sum() * 0.0
 
 
+def best_ce_loss(pred_scores, gt_scores, valid_len):
+    """
+    Cross-entropy treating the best image as the target class.
+    Directly minimises Top-1 error. Handles ties by averaging CE
+    across all tied-best images, and skips all-tied groups.
+    """
+    loss = 0.0
+    count = 0
+
+    for b in range(pred_scores.shape[0]):
+        n = int(valid_len[b].item())
+        if n < 2:
+            continue
+
+        logits = pred_scores[b, :n].view(-1)
+        gts = gt_scores[b, :n]
+
+        max_score = gts.max()
+        best_mask = (gts == max_score)
+
+        if best_mask.all():  # all images tied — no useful signal
+            continue
+
+        log_probs = F.log_softmax(logits, dim=0)
+        loss += -log_probs[best_mask].mean()
+        count += 1
+
+    if count > 0:
+        return loss / count
+    return pred_scores.sum() * 0.0
+
+
 def score_ranking_loss(pred_scores, gt_scores, valid_len, margin=1.0):
     """
     Score-proportional hinge loss over all pairs.
@@ -260,6 +292,7 @@ def main():
     temperature = getattr(cfg.train, 'temperature', 0.3)
     target_temperature = getattr(cfg.train, 'target_temperature', 2.0)
     margin_weight = getattr(cfg.train, 'margin_weight', 0.5)
+    ce_weight = getattr(cfg.train, 'ce_weight', 1.0)
     accum_steps = getattr(cfg.train, 'gradient_accumulation_steps', 4)
     warmup_epochs = getattr(cfg.train, 'warmup_epochs', 1)
     use_cached = args.cached or getattr(cfg.train, 'use_cached_features', False)
@@ -356,7 +389,8 @@ def main():
                     preds = model(data, vlen)
                     kl = listwise_kl_loss(preds, scores, vlen, temperature=temperature, target_temperature=target_temperature)
                     ranking = score_ranking_loss(preds, scores, vlen)
-                    loss = kl + margin_weight * ranking
+                    ce = best_ce_loss(preds, scores, vlen)
+                    loss = kl + margin_weight * ranking + ce_weight * ce
                     loss = loss / accum_steps
 
                 scaler.scale(loss).backward()

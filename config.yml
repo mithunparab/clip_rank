@@ -23,16 +23,17 @@ train:
   batch_size: 2
   lr_head: 0.001
   lr_backbone: 0.000001
-  epochs: 15
+  epochs: 50
   weight_decay: 0.01
   grad_clip: 1.0
   seed: 42
   save_dir: "checkpoints"
-  patience: 15
+  patience: 20
   # Soft-target KLD + lower backbone LR for stability
   temperature: 0.3
   target_temperature: 2.0
   margin_weight: 0.5
+  ce_weight: 1.0
   warmup_epochs: 1
   gradient_accumulation_steps: 4
   use_cached_features: false
