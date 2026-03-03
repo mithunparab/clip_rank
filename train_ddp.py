@@ -188,8 +188,10 @@ def validate(model, df_val, cfg, device, use_cached=False, cache_dir="cached_fea
             preds = model(batch, valid_lens=valid_len).view(-1).cpu().numpy()
             gt_arr = np.array(scores)
 
-            # Top-1 precision: did model pick the actual best image?
-            top1_hits += int(gt_arr[np.argmax(preds)] == gt_arr.max())
+            # Gold accuracy: for groups with a gold image (>=7), did model pick one?
+            if gt_arr.max() >= 7:
+                top1_hits += int(gt_arr[np.argmax(preds)] >= 7)
+                total_groups += 1
 
             # Spearman ρ: full rank correlation (skip constant groups)
             if len(np.unique(gt_arr)) > 1:
@@ -197,12 +199,11 @@ def validate(model, df_val, cfg, device, use_cached=False, cache_dir="cached_fea
                 spearman_scores.append(float(rho) if not np.isnan(rho) else 0.0)
 
             ndcg_scores.append(compute_ndcg(preds, gt_arr))
-            total_groups += 1
 
-    top1 = top1_hits / total_groups if total_groups > 0 else 0.0
+    gold_acc = top1_hits / total_groups if total_groups > 0 else 0.0
     spearman = np.mean(spearman_scores) if spearman_scores else 0.0
     ndcg = np.mean(ndcg_scores) if ndcg_scores else 0.0
-    return top1, spearman, ndcg
+    return gold_acc, spearman, ndcg
 
 
 def _validate_cached(model, df_val, device, cache_dir):
@@ -240,19 +241,20 @@ def _validate_cached(model, df_val, device, cache_dir):
             preds = model.head(batch).view(-1).cpu().numpy()
             gt_arr = np.array(scores)
 
-            top1_hits += int(gt_arr[np.argmax(preds)] == gt_arr.max())
+            if gt_arr.max() >= 7:
+                top1_hits += int(gt_arr[np.argmax(preds)] >= 7)
+                total_groups += 1
 
             if len(np.unique(gt_arr)) > 1:
                 rho, _ = spearmanr(preds, gt_arr)
                 spearman_scores.append(float(rho) if not np.isnan(rho) else 0.0)
 
             ndcg_scores.append(compute_ndcg(preds, gt_arr))
-            total_groups += 1
 
-    top1 = top1_hits / total_groups if total_groups > 0 else 0.0
+    gold_acc = top1_hits / total_groups if total_groups > 0 else 0.0
     spearman = np.mean(spearman_scores) if spearman_scores else 0.0
     ndcg = np.mean(ndcg_scores) if ndcg_scores else 0.0
-    return top1, spearman, ndcg
+    return gold_acc, spearman, ndcg
 
 
 def save_checkpoint(model, optimizer, epoch, path, is_best=False):
@@ -423,13 +425,13 @@ def main():
         if rank == 0:
             avg_loss = total_loss / len(train_loader)
             raw_val = model.module if hasattr(model, 'module') else model
-            top1, spearman, ndcg = validate(raw_val, val_df, cfg, device, use_cached=use_cached, cache_dir=cache_dir)
+            gold_acc, spearman, ndcg = validate(raw_val, val_df, cfg, device, use_cached=use_cached, cache_dir=cache_dir)
 
             current_lr = optimizer.param_groups[0]['lr']
-            print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Top1: {top1:.2%} | Spearman: {spearman:.4f} | NDCG: {ndcg:.4f} | LR: {current_lr:.2e}")
+            print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | GoldAcc: {gold_acc:.2%} | Spearman: {spearman:.4f} | NDCG: {ndcg:.4f} | LR: {current_lr:.2e}")
 
-            if top1 > best_acc:
-                best_acc = top1
+            if gold_acc > best_acc:
+                best_acc = gold_acc
                 patience_counter = 0
                 save_checkpoint(model, optimizer, epoch + 1, f"{cfg.train.save_dir}/last.pth", is_best=True)
             else:
@@ -437,7 +439,7 @@ def main():
                 save_checkpoint(model, optimizer, epoch + 1, f"{cfg.train.save_dir}/last.pth", is_best=False)
 
             if patience_counter >= patience:
-                print(f"Early stopping. Best Top1: {best_acc:.2%}")
+                print(f"Early stopping. Best GoldAcc: {best_acc:.2%}")
                 break
 
     cleanup_ddp()
