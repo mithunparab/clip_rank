@@ -7,14 +7,9 @@ import pandas as pd
 
 
 def _remap_score(raw, label):
-    """Apply label-based score remapping."""
-    lbl = str(label).lower()
-    if raw >= 8:
-        if lbl in ['outdoor', 'bathroom', 'other', 'balcony']:
-            return 0.0
-        if lbl == 'bedroom':
-            return 3.0
-    return raw
+    """Scores are in [-10, 10] (human-verified scale). No label remapping needed —
+    annotators already accounted for room type when scoring."""
+    return float(raw)
 
 
 class PropertyPreferenceDataset(Dataset):
