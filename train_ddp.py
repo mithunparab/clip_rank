@@ -61,13 +61,15 @@ def listwise_kl_loss(pred_scores, gt_scores, valid_len, temperature=1.0, target_
     return pred_scores.sum() * 0.0
 
 
-def pairwise_margin_loss(pred_scores, gt_scores, valid_len, margin=1.0):
+def score_ranking_loss(pred_scores, gt_scores, valid_len, margin=1.0):
     """
-    Pairwise margin loss: higher-scored items should outscore lower-scored by margin.
-    Complements KL by enforcing minimum score separation between tiers.
+    Score-proportional hinge loss over all pairs.
+    Expected logit gap scales with the actual score difference — no tier
+    discretization, no ignored within-tier pairs. Scores are in [-10, 10].
     """
     loss = 0.0
     count = 0
+    score_range = 20.0  # max possible gap in [-10, 10]
 
     for b in range(pred_scores.shape[0]):
         n = int(valid_len[b].item())
@@ -77,21 +79,14 @@ def pairwise_margin_loss(pred_scores, gt_scores, valid_len, margin=1.0):
         logits = pred_scores[b, :n].view(-1)
         gts = gt_scores[b, :n]
 
-        # Tier: 2=gold(>=7), 1=silver(>=0), 0=bronze — scores are [-10, 10]
-        tiers = torch.zeros_like(gts, dtype=torch.float32)
-        tiers[gts >= 0] = 1
-        tiers[gts >= 7] = 2
-
         for i in range(n):
             for j in range(i + 1, n):
-                if tiers[i] == tiers[j]:
+                diff = (gts[i] - gts[j]).item()
+                if diff == 0:
                     continue
-                if tiers[i] > tiers[j]:
-                    hi, lo = i, j
-                else:
-                    hi, lo = j, i
-                # hinge: want logits[hi] > logits[lo] + margin
-                pair_loss = F.relu(margin - (logits[hi] - logits[lo]))
+                hi, lo = (i, j) if diff > 0 else (j, i)
+                expected_margin = margin * abs(diff) / score_range
+                pair_loss = F.relu(expected_margin - (logits[hi] - logits[lo]))
                 loss += pair_loss
                 count += 1
 
@@ -121,6 +116,7 @@ def compute_ndcg(pred_scores, gt_scores):
 
 
 def validate(model, df_val, cfg, device, use_cached=False, cache_dir="cached_features"):
+    from scipy.stats import spearmanr
     model.eval()
 
     if use_cached:
@@ -135,9 +131,10 @@ def validate(model, df_val, cfg, device, use_cached=False, cache_dir="cached_fea
         df_val['file_path'] = df_val.index.map(lambda x: f"images/{x}.jpg")
 
     grouped = df_val.groupby('group_id')
-    strict_wins = 0
+    top1_hits = 0
     total_groups = 0
     ndcg_scores = []
+    spearman_scores = []
 
     with torch.no_grad():
         for _, group in grouped:
@@ -159,38 +156,35 @@ def validate(model, df_val, cfg, device, use_cached=False, cache_dir="cached_fea
             preds = model(batch, valid_lens=valid_len).view(-1).cpu().numpy()
             gt_arr = np.array(scores)
 
-            # Strict tier accuracy
-            best_idx = np.argmax(preds)
-            best_score = scores[best_idx]
-            max_possible = max(scores)
+            # Top-1 precision: did model pick the actual best image?
+            top1_hits += int(gt_arr[np.argmax(preds)] == gt_arr.max())
 
-            # Scores are [-10, 10]: gold >= 7, silver >= 0, bronze < 0
-            picked_tier = 2 if best_score >= 7 else (1 if best_score >= 0 else 0)
-            max_tier = 2 if max_possible >= 7 else (1 if max_possible >= 0 else 0)
+            # Spearman ρ: full rank correlation (skip constant groups)
+            if len(np.unique(gt_arr)) > 1:
+                rho, _ = spearmanr(preds, gt_arr)
+                spearman_scores.append(float(rho) if not np.isnan(rho) else 0.0)
 
-            if picked_tier == max_tier:
-                strict_wins += 1
-
-            # NDCG — full ranking quality
             ndcg_scores.append(compute_ndcg(preds, gt_arr))
-
             total_groups += 1
 
-    acc = strict_wins / total_groups if total_groups > 0 else 0.0
+    top1 = top1_hits / total_groups if total_groups > 0 else 0.0
+    spearman = np.mean(spearman_scores) if spearman_scores else 0.0
     ndcg = np.mean(ndcg_scores) if ndcg_scores else 0.0
-    return acc, ndcg
+    return top1, spearman, ndcg
 
 
 def _validate_cached(model, df_val, device, cache_dir):
     """Fast validation using precomputed features."""
+    from scipy.stats import spearmanr
     if 'file_path' not in df_val.columns:
         df_val = df_val.copy()
         df_val['file_path'] = df_val.index.map(lambda x: f"images/{x}.jpg")
 
     grouped = df_val.groupby('group_id')
-    strict_wins = 0
+    top1_hits = 0
     total_groups = 0
     ndcg_scores = []
+    spearman_scores = []
 
     with torch.no_grad():
         for _, group in grouped:
@@ -210,28 +204,23 @@ def _validate_cached(model, df_val, device, cache_dir):
                 continue
 
             batch = torch.stack(features).unsqueeze(0).to(device)
-            valid_len = torch.tensor([len(features)])
 
             preds = model.head(batch).view(-1).cpu().numpy()
             gt_arr = np.array(scores)
 
-            best_idx = np.argmax(preds)
-            best_score = scores[best_idx]
-            max_possible = max(scores)
+            top1_hits += int(gt_arr[np.argmax(preds)] == gt_arr.max())
 
-            # Scores are [-10, 10]: gold >= 7, silver >= 0, bronze < 0
-            picked_tier = 2 if best_score >= 7 else (1 if best_score >= 0 else 0)
-            max_tier = 2 if max_possible >= 7 else (1 if max_possible >= 0 else 0)
-
-            if picked_tier == max_tier:
-                strict_wins += 1
+            if len(np.unique(gt_arr)) > 1:
+                rho, _ = spearmanr(preds, gt_arr)
+                spearman_scores.append(float(rho) if not np.isnan(rho) else 0.0)
 
             ndcg_scores.append(compute_ndcg(preds, gt_arr))
             total_groups += 1
 
-    acc = strict_wins / total_groups if total_groups > 0 else 0.0
+    top1 = top1_hits / total_groups if total_groups > 0 else 0.0
+    spearman = np.mean(spearman_scores) if spearman_scores else 0.0
     ndcg = np.mean(ndcg_scores) if ndcg_scores else 0.0
-    return acc, ndcg
+    return top1, spearman, ndcg
 
 
 def save_checkpoint(model, optimizer, epoch, path, is_best=False):
@@ -366,8 +355,8 @@ def main():
                 with torch.amp.autocast("cuda"):
                     preds = model(data, vlen)
                     kl = listwise_kl_loss(preds, scores, vlen, temperature=temperature, target_temperature=target_temperature)
-                    margin = pairwise_margin_loss(preds, scores, vlen)
-                    loss = kl + margin_weight * margin
+                    ranking = score_ranking_loss(preds, scores, vlen)
+                    loss = kl + margin_weight * ranking
                     loss = loss / accum_steps
 
                 scaler.scale(loss).backward()
@@ -381,8 +370,8 @@ def main():
             else:
                 preds = model(data, vlen)
                 kl = listwise_kl_loss(preds, scores, vlen, temperature=temperature, target_temperature=target_temperature)
-                margin = pairwise_margin_loss(preds, scores, vlen)
-                loss = kl + margin_weight * margin
+                ranking = score_ranking_loss(preds, scores, vlen)
+                loss = kl + margin_weight * ranking
                 loss = loss / accum_steps
 
                 loss.backward()
@@ -399,13 +388,13 @@ def main():
         if rank == 0:
             avg_loss = total_loss / len(train_loader)
             raw_val = model.module if hasattr(model, 'module') else model
-            acc, ndcg = validate(raw_val, val_df, cfg, device, use_cached=use_cached, cache_dir=cache_dir)
+            top1, spearman, ndcg = validate(raw_val, val_df, cfg, device, use_cached=use_cached, cache_dir=cache_dir)
 
             current_lr = optimizer.param_groups[0]['lr']
-            print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Acc: {acc:.2%} | NDCG: {ndcg:.4f} | LR: {current_lr:.2e}")
+            print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Top1: {top1:.2%} | Spearman: {spearman:.4f} | NDCG: {ndcg:.4f} | LR: {current_lr:.2e}")
 
-            if acc > best_acc:
-                best_acc = acc
+            if spearman > best_acc:
+                best_acc = spearman
                 patience_counter = 0
                 save_checkpoint(model, optimizer, epoch + 1, f"{cfg.train.save_dir}/last.pth", is_best=True)
             else:
@@ -413,7 +402,7 @@ def main():
                 save_checkpoint(model, optimizer, epoch + 1, f"{cfg.train.save_dir}/last.pth", is_best=False)
 
             if patience_counter >= patience:
-                print(f"Early stopping. Best Acc: {best_acc:.2%}")
+                print(f"Early stopping. Best Spearman: {best_acc:.4f}")
                 break
 
     cleanup_ddp()
