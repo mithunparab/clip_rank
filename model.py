@@ -156,19 +156,50 @@ class BirderBackboneWrapper(nn.Module):
 
 
 class RankingHead(nn.Module):
-    """LayerNorm + 2-layer MLP head with dropout."""
+    """Cross-image self-attention + MLP head.
+
+    Scores each image relative to the group context rather than
+    independently. Equivalent to one transformer encoder layer over
+    the group, followed by a per-image MLP projection.
+
+    Human annotators judge images comparatively — this makes the model
+    do the same. A mediocre photo looks worse when the group contains
+    a gold image; the attention lets the model detect this contrast.
+    """
     def __init__(self, in_dim, hidden_dim=256, dropout=0.1):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(in_dim),
+        # All backbone dims (512, 768, 1024, 1536) are divisible by 8
+        n_heads = 8
+        self.norm1 = nn.LayerNorm(in_dim)
+        self.attn = nn.MultiheadAttention(
+            in_dim, n_heads, dropout=dropout, batch_first=True
+        )
+        self.norm2 = nn.LayerNorm(in_dim)
+        self.mlp = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, x):
-        return self.net(x)
+    def forward(self, x, valid_lens=None):
+        # x: (B, G, in_dim)
+        B, G, _ = x.shape
+
+        # Mask padded positions so valid images don't attend to padding
+        key_padding_mask = None
+        if valid_lens is not None:
+            key_padding_mask = (
+                torch.arange(G, device=x.device).unsqueeze(0)
+                >= valid_lens.unsqueeze(1)
+            )  # True = ignore
+
+        normed = self.norm1(x)
+        attn_out, _ = self.attn(
+            normed, normed, normed, key_padding_mask=key_padding_mask
+        )
+        x = x + attn_out           # residual
+        return self.mlp(self.norm2(x))  # (B, G, 1)
 
 
 class MobileCLIPRanker(nn.Module):
@@ -277,5 +308,5 @@ class MobileCLIPRanker(nn.Module):
         else:
             features = x
 
-        scores = self.head(features)
+        scores = self.head(features, valid_lens=valid_lens)
         return scores
