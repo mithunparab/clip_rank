@@ -31,10 +31,22 @@ def cleanup_ddp():
         dist.destroy_process_group()
 
 
-def listwise_kl_loss(pred_scores, gt_scores, valid_len, temperature=1.0, target_temperature=2.0):
+def to_tier(scores):
+    """Map raw [-10,10] scores to tier values {0.0, 0.5, 1.0}.
+    Data has 3 natural clusters with gaps at [-6,-3] and [3,6]."""
+    t = torch.zeros_like(scores)
+    t[scores >= 0] = 0.5   # neutral
+    t[scores >= 7] = 1.0   # gold
+    return t
+
+
+def listwise_kl_loss(pred_scores, gt_scores, valid_len, temperature=1.0, target_temperature=0.5):
     """
-    KL divergence with score-proportional soft targets.
-    Reached 97.27% — the terrain signal works. Needs stable LR to not crash.
+    KL divergence with tier-based soft targets {0, 0.5, 1.0}.
+    Raw score regression on [-10,10] was wrong — data has 3 discrete
+    clusters. Tier targets push same-tier images to same region (like
+    embedding KLD into likewise groups). target_temperature=0.5 gives
+    clear separation between tiers.
     """
     loss = 0.0
     valid_batches = 0
@@ -47,8 +59,8 @@ def listwise_kl_loss(pred_scores, gt_scores, valid_len, temperature=1.0, target_
         logits = pred_scores[b, :n].view(-1)
         gts = gt_scores[b, :n]
 
-        # Score-proportional soft targets
-        target_probs = F.softmax(gts / target_temperature, dim=0)
+        tier_targets = to_tier(gts)
+        target_probs = F.softmax(tier_targets / target_temperature, dim=0)
 
         log_probs = F.log_softmax(logits / temperature, dim=0)
         batch_loss = -torch.sum(target_probs * log_probs)
@@ -93,12 +105,11 @@ def best_ce_loss(pred_scores, gt_scores, valid_len):
     return pred_scores.sum() * 0.0
 
 
-def score_regression_loss(pred_scores, gt_scores, valid_len, score_scale=10.0):
+def score_regression_loss(pred_scores, gt_scores, valid_len):
     """
-    Smooth-L1 regression: teach the model what score each image deserves.
-    Targets normalised to [-1, 1] (divide by score_scale=10).
-    This is the primary signal for overall score understanding —
-    gold accuracy follows naturally when regression is accurate.
+    Smooth-L1 regression to tier targets {0.0, 0.5, 1.0}.
+    Teaches absolute tier membership (bronze/neutral/gold) rather than
+    raw score magnitude — matches the 3-cluster structure of the data.
     """
     loss = 0.0
     count = 0
@@ -108,7 +119,7 @@ def score_regression_loss(pred_scores, gt_scores, valid_len, score_scale=10.0):
         if n < 2:
             continue
         preds = pred_scores[b, :n].view(-1)
-        targets = gt_scores[b, :n] / score_scale  # [-10,10] → [-1,1]
+        targets = to_tier(gt_scores[b, :n])  # {0.0, 0.5, 1.0}
         loss += F.smooth_l1_loss(preds, targets)
         count += 1
 
@@ -395,9 +406,10 @@ def main():
                     optimizer.zero_grad(set_to_none=True)
             else:
                 preds = model(data, vlen)
+                reg = score_regression_loss(preds, scores, vlen)
                 kl = listwise_kl_loss(preds, scores, vlen, temperature=temperature, target_temperature=target_temperature)
-                ranking = score_ranking_loss(preds, scores, vlen)
-                loss = kl + margin_weight * ranking
+                ce = best_ce_loss(preds, scores, vlen)
+                loss = reg + margin_weight * kl + ce_weight * ce
                 loss = loss / accum_steps
 
                 loss.backward()
