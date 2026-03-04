@@ -21,7 +21,7 @@ model:
 
 train:
   batch_size: 2
-  lr_head: 0.001
+  lr_head: 0.0002
   lr_backbone: 0.000001
   epochs: 50
   weight_decay: 0.01
@@ -34,6 +34,6 @@ train:
   target_temperature: 2.0
   margin_weight: 0.3   # weight for KLD ranking loss
   ce_weight: 1.0       # weight for best-image CE loss
-  warmup_epochs: 1
+  warmup_epochs: 5
   gradient_accumulation_steps: 4
   use_cached_features: false

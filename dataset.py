@@ -43,21 +43,12 @@ class PropertyPreferenceDataset(Dataset):
             ])
 
         self.groups = []
-        skipped = 0
         if not self.df.empty:
             grouped = self.df.groupby('group_id')
             for _, group in grouped:
                 if len(group) < 2:
                     continue
-                if is_train:
-                    # Only train on groups that have at least one gold image —
-                    # aligned with gold accuracy metric; skips bronze/silver-only noise
-                    if group['score'].astype(float).max() < GOLD_THRESHOLD:
-                        skipped += 1
-                        continue
                 self.groups.append(group.to_dict('records'))
-        if is_train and skipped:
-            print(f"Skipped {skipped} groups with no gold image (max score < {GOLD_THRESHOLD})")
 
     def _process(self, path):
         try:
