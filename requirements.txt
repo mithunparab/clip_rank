@@ -14,3 +14,9 @@ onnxruntime
 openvino
 birder
 git+https://github.com/apple/ml-mobileclip.git
+unsloth
+trl
+peft
+bitsandbytes
+accelerate
+datasets
