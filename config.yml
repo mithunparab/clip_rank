@@ -31,7 +31,7 @@ train:
   patience: 20
   # Soft-target KLD + lower backbone LR for stability
   temperature: 0.3
-  target_temperature: 2.0
+  target_temperature: 0.5
   margin_weight: 0.3   # weight for KLD ranking loss
   ce_weight: 1.0       # weight for best-image CE loss
   warmup_epochs: 5
