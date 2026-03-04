@@ -7,6 +7,7 @@ over inaccurate ones for property photos.
 
 import json
 import yaml
+import torch
 from unsloth import FastVisionModel
 from trl import DPOTrainer, DPOConfig
 from datasets import Dataset
@@ -100,8 +101,8 @@ def main():
             max_steps=dpo_cfg.get("max_steps", 200),
             learning_rate=dpo_cfg.get("lr", 5e-5),
             beta=dpo_cfg.get("beta", 0.1),
-            fp16=not FastVisionModel.supports_bf16(),
-            bf16=FastVisionModel.supports_bf16(),
+            fp16=not torch.cuda.is_bf16_supported(),
+            bf16=torch.cuda.is_bf16_supported(),
             logging_steps=5,
             save_strategy="steps",
             save_steps=dpo_cfg.get("save_steps", 50),

@@ -7,7 +7,7 @@ Uses unsloth FastVisionModel + LoRA for efficient training.
 
 import json
 import yaml
-from types import SimpleNamespace
+import torch
 from unsloth import FastVisionModel
 from trl import SFTTrainer, SFTConfig
 from unsloth.trainer import UnslothVisionDataCollator
@@ -96,8 +96,8 @@ def main():
             warmup_steps=sft_cfg.get("warmup_steps", 50),
             max_steps=sft_cfg.get("max_steps", 500),
             learning_rate=sft_cfg.get("lr", 2e-4),
-            fp16=not FastVisionModel.supports_bf16(),
-            bf16=FastVisionModel.supports_bf16(),
+            fp16=not torch.cuda.is_bf16_supported(),
+            bf16=torch.cuda.is_bf16_supported(),
             logging_steps=10,
             eval_strategy="steps",
             eval_steps=sft_cfg.get("eval_steps", 50),
