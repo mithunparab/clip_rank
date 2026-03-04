@@ -191,7 +191,7 @@ class RankingHead(nn.Module):
         if valid_lens is not None:
             key_padding_mask = (
                 torch.arange(G, device=x.device).unsqueeze(0)
-                >= valid_lens.unsqueeze(1)
+                >= valid_lens.to(x.device).unsqueeze(1)
             )  # True = ignore
 
         normed = self.norm1(x)
