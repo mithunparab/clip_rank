@@ -62,22 +62,8 @@ def main():
         use_gradient_checkpointing="unsloth",
     )
 
-    # Re-apply LoRA for DPO (ref_model=None uses implicit LoRA reference)
-    lora_cfg = vlm_cfg.get("lora", {})
-    model = FastVisionModel.get_peft_model(
-        model,
-        finetune_vision_layers=True,
-        finetune_language_layers=True,
-        finetune_attention_modules=True,
-        finetune_mlp_modules=True,
-        r=lora_cfg.get("r", 16),
-        lora_alpha=lora_cfg.get("lora_alpha", 16),
-        lora_dropout=lora_cfg.get("lora_dropout", 0),
-        bias="none",
-        random_state=42,
-        use_rslora=False,
-        loftq_config=None,
-    )
+    # SFT checkpoint already has LoRA adapters — just enable training.
+    # ref_model=None in DPOTrainer uses implicit LoRA reference.
 
     # Load DPO data
     with open("data/dpo_train.json") as f:
