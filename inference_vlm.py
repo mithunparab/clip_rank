@@ -17,8 +17,9 @@ from transformers import AutoProcessor
 
 
 PROMPT_TEXT = (
-    "Rate this property photo on a scale of 1 to 10 based on composition, "
-    "lighting, staging, and overall appeal for a real estate listing."
+    "Score this property photo from 1 to 10. "
+    "A high score means a spacious, well-lit living room that highlights open floor area. "
+    "A low score means cramped, cluttered, or non-living-room photos."
 )
 
 

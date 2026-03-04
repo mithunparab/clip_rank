@@ -12,8 +12,9 @@ import pandas as pd
 import yaml
 
 PROMPT_TEXT = (
-    "Rate this property photo on a scale of 1 to 10 based on composition, "
-    "lighting, staging, and overall appeal for a real estate listing."
+    "Score this property photo from 1 to 10. "
+    "A high score means a spacious, well-lit living room that highlights open floor area. "
+    "A low score means cramped, cluttered, or non-living-room photos."
 )
 
 LABEL_DESCRIPTIONS = {
@@ -41,20 +42,18 @@ def describe_label(label: str) -> str:
     return LABEL_DESCRIPTIONS.get(str(label).strip().lower(), "property")
 
 
-def quality_word(rating: int) -> str:
-    if rating >= 8:
-        return "Excellent"
-    if rating >= 6:
-        return "Good"
-    if rating >= 4:
-        return "Average"
-    return "Poor"
-
-
 def build_response(rating: int, label: str) -> str:
-    desc = describe_label(label)
-    word = quality_word(rating)
-    return f"Rating: {rating}/10\n{word} {desc} photo."
+    if rating >= 8:
+        reason = "Spacious living room with open floor area, good lighting and composition."
+    elif rating >= 6:
+        reason = "Decent room photo with reasonable space visible."
+    elif rating >= 4:
+        reason = "Average photo, limited sense of space or not a primary living area."
+    elif rating >= 2:
+        reason = "Cramped or cluttered, poor composition."
+    else:
+        reason = "Not a living room or extremely poor quality."
+    return f"Rating: {rating}/10\n{reason}"
 
 
 def make_sft_entry(row_idx: int, rating: int, label: str) -> dict:
