@@ -93,34 +93,24 @@ def best_ce_loss(pred_scores, gt_scores, valid_len):
     return pred_scores.sum() * 0.0
 
 
-def score_ranking_loss(pred_scores, gt_scores, valid_len, margin=1.0):
+def score_regression_loss(pred_scores, gt_scores, valid_len, score_scale=10.0):
     """
-    Score-proportional hinge loss over all pairs.
-    Expected logit gap scales with the actual score difference — no tier
-    discretization, no ignored within-tier pairs. Scores are in [-10, 10].
+    Smooth-L1 regression: teach the model what score each image deserves.
+    Targets normalised to [-1, 1] (divide by score_scale=10).
+    This is the primary signal for overall score understanding —
+    gold accuracy follows naturally when regression is accurate.
     """
     loss = 0.0
     count = 0
-    score_range = 20.0  # max possible gap in [-10, 10]
 
     for b in range(pred_scores.shape[0]):
         n = int(valid_len[b].item())
         if n < 2:
             continue
-
-        logits = pred_scores[b, :n].view(-1)
-        gts = gt_scores[b, :n]
-
-        for i in range(n):
-            for j in range(i + 1, n):
-                diff = (gts[i] - gts[j]).item()
-                if diff == 0:
-                    continue
-                hi, lo = (i, j) if diff > 0 else (j, i)
-                expected_margin = margin * abs(diff) / score_range
-                pair_loss = F.relu(expected_margin - (logits[hi] - logits[lo]))
-                loss += pair_loss
-                count += 1
+        preds = pred_scores[b, :n].view(-1)
+        targets = gt_scores[b, :n] / score_scale  # [-10,10] → [-1,1]
+        loss += F.smooth_l1_loss(preds, targets)
+        count += 1
 
     if count > 0:
         return loss / count
@@ -389,10 +379,10 @@ def main():
             if use_amp:
                 with torch.amp.autocast("cuda"):
                     preds = model(data, vlen)
+                    reg = score_regression_loss(preds, scores, vlen)
                     kl = listwise_kl_loss(preds, scores, vlen, temperature=temperature, target_temperature=target_temperature)
-                    ranking = score_ranking_loss(preds, scores, vlen)
                     ce = best_ce_loss(preds, scores, vlen)
-                    loss = kl + margin_weight * ranking + ce_weight * ce
+                    loss = reg + margin_weight * kl + ce_weight * ce
                     loss = loss / accum_steps
 
                 scaler.scale(loss).backward()
