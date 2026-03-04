@@ -31,53 +31,21 @@ def cleanup_ddp():
         dist.destroy_process_group()
 
 
-def to_tier(scores):
-    """Map raw [-10,10] scores to tier values {0.0, 0.5, 1.0}.
-    Data has 3 natural clusters with gaps at [-6,-3] and [3,6]."""
-    t = torch.zeros_like(scores)
-    t[scores >= 0] = 0.5   # neutral
-    t[scores >= 7] = 1.0   # gold
-    return t
-
-
-def listwise_kl_loss(pred_scores, gt_scores, valid_len, temperature=1.0, target_temperature=0.5):
+def gold_set_loss(pred_scores, gt_scores, valid_len):
     """
-    KL divergence with tier-based soft targets {0, 0.5, 1.0}.
-    Raw score regression on [-10,10] was wrong — data has 3 discrete
-    clusters. Tier targets push same-tier images to same region (like
-    embedding KLD into likewise groups). target_temperature=0.5 gives
-    clear separation between tiers.
-    """
-    loss = 0.0
-    valid_batches = 0
+    Direct gold-accuracy surrogate.
 
-    for b in range(pred_scores.shape[0]):
-        n = int(valid_len[b].item())
-        if n < 2:
-            continue
+    P(argmax ∈ gold) = Σ_{i:gold} softmax(pred)_i
+                     = exp(logsumexp(pred[gold])) / exp(logsumexp(pred))
 
-        logits = pred_scores[b, :n].view(-1)
-        gts = gt_scores[b, :n]
+    Loss = -log P(argmax ∈ gold)
+         = logsumexp(pred[all]) - logsumexp(pred[gold])
 
-        tier_targets = to_tier(gts)
-        target_probs = F.softmax(tier_targets / target_temperature, dim=0)
+    Unlike CE on a single best image or mean log-prob over golds, this
+    is the exact expression for "probability that any gold image wins",
+    which is what gold_acc measures.
 
-        log_probs = F.log_softmax(logits / temperature, dim=0)
-        batch_loss = -torch.sum(target_probs * log_probs)
-
-        loss += batch_loss
-        valid_batches += 1
-
-    if valid_batches > 0:
-        return loss / valid_batches
-    return pred_scores.sum() * 0.0
-
-
-def best_ce_loss(pred_scores, gt_scores, valid_len):
-    """
-    Gold-tier CE: for groups with gold images (>=7), push ALL gold images'
-    log-prob up — any gold winning counts as a hit in gold_acc. For gold-free
-    groups fall back to raw top-1 CE. This aligns training loss with the metric.
+    For gold-free groups: standard top-1 CE (best raw score).
     """
     loss = 0.0
     count = 0
@@ -92,12 +60,9 @@ def best_ce_loss(pred_scores, gt_scores, valid_len):
 
         gold_mask = gts >= 7
         if gold_mask.any() and not gold_mask.all():
-            # Mixed gold/non-gold: push all gold probs up together
-            log_probs = F.log_softmax(logits, dim=0)
-            loss += -log_probs[gold_mask].mean()
+            loss += torch.logsumexp(logits, dim=0) - torch.logsumexp(logits[gold_mask], dim=0)
             count += 1
         else:
-            # Gold-free group: raw best-image CE
             max_score = gts.max()
             best_mask = (gts == max_score)
             if not best_mask.all():
@@ -110,12 +75,21 @@ def best_ce_loss(pred_scores, gt_scores, valid_len):
     return pred_scores.sum() * 0.0
 
 
-def tier_pairwise_loss(pred_scores, gt_scores, valid_len):
+def plackett_luce_loss(pred_scores, gt_scores, valid_len, temperature=1.0):
     """
-    Vectorized pairwise hinge using tier-gap margins.
-    Enforces pred[i] - pred[j] >= tier[i] - tier[j] for all i > j in tier.
-    Margins: gold-neutral=0.5, gold-bronze=1.0, neutral-bronze=0.5.
-    More direct than smooth-L1 to tier targets — explicitly separates tiers.
+    Plackett-Luce listwise ranking loss.
+
+    Models full-group ranking probability rather than independent pairs:
+      P(ranking π) = Π_i exp(r_{π(i)}) / Σ_{j≥i} exp(r_{π(j)})
+      -log P = Σ_i [logsumexp(r_{π(i):}) - r_{π(i)}]
+
+    Advantages over BT:
+    - No saturation: gradient persists even for large score gaps
+    - Listwise: each position's gradient is conditioned on who remains
+    - O(n) via logcumsumexp (no O(n²) pairwise loop)
+
+    Tiny noise breaks ties randomly so tied images don't create
+    degenerate gradients (no strict preference between them).
     """
     loss = 0.0
     count = 0
@@ -126,18 +100,21 @@ def tier_pairwise_loss(pred_scores, gt_scores, valid_len):
             continue
 
         preds = pred_scores[b, :n].view(-1)
-        tiers = to_tier(gt_scores[b, :n])
+        gts = gt_scores[b, :n]
 
-        # tier_diff[i,j] = tiers[i] - tiers[j]; pred_diff[i,j] = preds[i] - preds[j]
-        tier_diff = tiers.unsqueeze(1) - tiers.unsqueeze(0)
-        pred_diff = preds.unsqueeze(1) - preds.unsqueeze(0)
+        # Break ties with tiny noise — no strict preference within tied groups
+        gt_noisy = gts + torch.randn_like(gts) * 1e-4
+        order = torch.argsort(gt_noisy, descending=True)
+        sorted_preds = preds[order] / temperature
 
-        mask = tier_diff > 0  # pairs where i should rank above j
-        if not mask.any():
-            continue
+        # suffix logsumexp: log_cumsum[i] = logsumexp(sorted_preds[i:])
+        log_cumsum = torch.flip(
+            torch.logcumsumexp(torch.flip(sorted_preds, [0]), dim=0), [0]
+        )
 
-        violations = F.relu(tier_diff[mask] - pred_diff[mask])
-        loss += violations.mean()
+        # NLL = mean over positions 0..n-2 of (logsumexp(remaining) - pred[i])
+        pl_nll = (log_cumsum[:-1] - sorted_preds[:-1]).mean()
+        loss += pl_nll
         count += 1
 
     if count > 0:
@@ -308,11 +285,9 @@ def main():
 
     os.makedirs(cfg.train.save_dir, exist_ok=True)
 
-    # Config with defaults for new params
-    temperature = getattr(cfg.train, 'temperature', 0.3)
-    target_temperature = getattr(cfg.train, 'target_temperature', 2.0)
-    margin_weight = getattr(cfg.train, 'margin_weight', 0.5)
-    ce_weight = getattr(cfg.train, 'ce_weight', 1.0)
+    # Config
+    temperature = getattr(cfg.train, 'temperature', 0.3)   # PL prediction temperature
+    margin_weight = getattr(cfg.train, 'margin_weight', 0.3)  # PL loss weight
     accum_steps = getattr(cfg.train, 'gradient_accumulation_steps', 4)
     warmup_epochs = getattr(cfg.train, 'warmup_epochs', 1)
     use_cached = args.cached or getattr(cfg.train, 'use_cached_features', False)
@@ -408,7 +383,7 @@ def main():
     patience_counter = 0
 
     if rank == 0:
-        print(f"Training on {len(train_ds)} groups | KLD(T={temperature},T_tgt={target_temperature})+Margin(w={margin_weight}) | "
+        print(f"Training on {len(train_ds)} groups | GoldSet + PL(T={temperature}, w={margin_weight}) | "
               f"accum_steps={accum_steps} | warmup={warmup_epochs} | AMP={use_amp}")
 
     for epoch in range(cfg.train.epochs):
@@ -428,10 +403,9 @@ def main():
             if use_amp:
                 with torch.amp.autocast("cuda"):
                     preds = model(data, vlen)
-                    reg = tier_pairwise_loss(preds, scores, vlen)
-                    kl = listwise_kl_loss(preds, scores, vlen, temperature=temperature, target_temperature=target_temperature)
-                    ce = best_ce_loss(preds, scores, vlen)
-                    loss = reg + margin_weight * kl + ce_weight * ce
+                    gs = gold_set_loss(preds, scores, vlen)
+                    pl = plackett_luce_loss(preds, scores, vlen, temperature=temperature)
+                    loss = gs + margin_weight * pl
                     loss = loss / accum_steps
 
                 scaler.scale(loss).backward()
@@ -444,10 +418,9 @@ def main():
                     optimizer.zero_grad(set_to_none=True)
             else:
                 preds = model(data, vlen)
-                reg = tier_pairwise_loss(preds, scores, vlen)
-                kl = listwise_kl_loss(preds, scores, vlen, temperature=temperature, target_temperature=target_temperature)
-                ce = best_ce_loss(preds, scores, vlen)
-                loss = reg + margin_weight * kl + ce_weight * ce
+                gs = gold_set_loss(preds, scores, vlen)
+                pl = plackett_luce_loss(preds, scores, vlen, temperature=temperature)
+                loss = gs + margin_weight * pl
                 loss = loss / accum_steps
 
                 loss.backward()
