@@ -75,9 +75,9 @@ def listwise_kl_loss(pred_scores, gt_scores, valid_len, temperature=1.0, target_
 
 def best_ce_loss(pred_scores, gt_scores, valid_len):
     """
-    Cross-entropy treating the best image as the target class.
-    Directly minimises Top-1 error. Handles ties by averaging CE
-    across all tied-best images, and skips all-tied groups.
+    Gold-tier CE: for groups with gold images (>=7), push ALL gold images'
+    log-prob up — any gold winning counts as a hit in gold_acc. For gold-free
+    groups fall back to raw top-1 CE. This aligns training loss with the metric.
     """
     loss = 0.0
     count = 0
@@ -90,26 +90,32 @@ def best_ce_loss(pred_scores, gt_scores, valid_len):
         logits = pred_scores[b, :n].view(-1)
         gts = gt_scores[b, :n]
 
-        max_score = gts.max()
-        best_mask = (gts == max_score)
-
-        if best_mask.all():  # all images tied — no useful signal
-            continue
-
-        log_probs = F.log_softmax(logits, dim=0)
-        loss += -log_probs[best_mask].mean()
-        count += 1
+        gold_mask = gts >= 7
+        if gold_mask.any() and not gold_mask.all():
+            # Mixed gold/non-gold: push all gold probs up together
+            log_probs = F.log_softmax(logits, dim=0)
+            loss += -log_probs[gold_mask].mean()
+            count += 1
+        else:
+            # Gold-free group: raw best-image CE
+            max_score = gts.max()
+            best_mask = (gts == max_score)
+            if not best_mask.all():
+                log_probs = F.log_softmax(logits, dim=0)
+                loss += -log_probs[best_mask].mean()
+                count += 1
 
     if count > 0:
         return loss / count
     return pred_scores.sum() * 0.0
 
 
-def score_regression_loss(pred_scores, gt_scores, valid_len):
+def tier_pairwise_loss(pred_scores, gt_scores, valid_len):
     """
-    Smooth-L1 regression to tier targets {0.0, 0.5, 1.0}.
-    Teaches absolute tier membership (bronze/neutral/gold) rather than
-    raw score magnitude — matches the 3-cluster structure of the data.
+    Vectorized pairwise hinge using tier-gap margins.
+    Enforces pred[i] - pred[j] >= tier[i] - tier[j] for all i > j in tier.
+    Margins: gold-neutral=0.5, gold-bronze=1.0, neutral-bronze=0.5.
+    More direct than smooth-L1 to tier targets — explicitly separates tiers.
     """
     loss = 0.0
     count = 0
@@ -118,9 +124,20 @@ def score_regression_loss(pred_scores, gt_scores, valid_len):
         n = int(valid_len[b].item())
         if n < 2:
             continue
+
         preds = pred_scores[b, :n].view(-1)
-        targets = to_tier(gt_scores[b, :n])  # {0.0, 0.5, 1.0}
-        loss += F.smooth_l1_loss(preds, targets)
+        tiers = to_tier(gt_scores[b, :n])
+
+        # tier_diff[i,j] = tiers[i] - tiers[j]; pred_diff[i,j] = preds[i] - preds[j]
+        tier_diff = tiers.unsqueeze(1) - tiers.unsqueeze(0)
+        pred_diff = preds.unsqueeze(1) - preds.unsqueeze(0)
+
+        mask = tier_diff > 0  # pairs where i should rank above j
+        if not mask.any():
+            continue
+
+        violations = F.relu(tier_diff[mask] - pred_diff[mask])
+        loss += violations.mean()
         count += 1
 
     if count > 0:
@@ -302,11 +319,32 @@ def main():
     cache_dir = getattr(cfg.data, 'cached_features_dir', 'cached_features')
 
     df = pd.read_csv(cfg.data.csv_path)
+    # Set file_path early so duplicated rows inherit it correctly
+    if 'file_path' not in df.columns:
+        df['file_path'] = df.index.map(lambda x: os.path.join('images', f"{x}.jpg"))
 
     unique_groups = df['group_id'].unique()
     val_groups = unique_groups[:int(len(unique_groups) * 0.1)]
-    train_df = df[~df['group_id'].isin(val_groups)]
-    val_df = df[df['group_id'].isin(val_groups)]
+    train_df = df[~df['group_id'].isin(val_groups)].copy()
+    val_df = df[df['group_id'].isin(val_groups)].copy()
+
+    # Oversample gold-containing groups 3x — gold groups are ~14% of data;
+    # more frequent gold-vs-non-gold gradient is the key to gold accuracy.
+    gold_gids = (
+        train_df.groupby('group_id')['score']
+        .max()
+        .pipe(lambda s: set(s[s >= 7].index))
+    )
+    if gold_gids:
+        gold_rows = train_df[train_df['group_id'].isin(gold_gids)]
+        copies = []
+        for i in range(2):  # 2 extra copies = 3x total
+            dup = gold_rows.copy()
+            dup['group_id'] = dup['group_id'].apply(lambda x: f"{x}__aug{i}")
+            copies.append(dup)
+        train_df = pd.concat([train_df] + copies, ignore_index=True)
+        if rank == 0:
+            print(f"Oversampled {len(gold_gids)} gold groups 3x → {train_df['group_id'].nunique()} total groups")
 
     if use_cached:
         if not os.path.isdir(cache_dir):
@@ -390,7 +428,7 @@ def main():
             if use_amp:
                 with torch.amp.autocast("cuda"):
                     preds = model(data, vlen)
-                    reg = score_regression_loss(preds, scores, vlen)
+                    reg = tier_pairwise_loss(preds, scores, vlen)
                     kl = listwise_kl_loss(preds, scores, vlen, temperature=temperature, target_temperature=target_temperature)
                     ce = best_ce_loss(preds, scores, vlen)
                     loss = reg + margin_weight * kl + ce_weight * ce
@@ -406,7 +444,7 @@ def main():
                     optimizer.zero_grad(set_to_none=True)
             else:
                 preds = model(data, vlen)
-                reg = score_regression_loss(preds, scores, vlen)
+                reg = tier_pairwise_loss(preds, scores, vlen)
                 kl = listwise_kl_loss(preds, scores, vlen, temperature=temperature, target_temperature=target_temperature)
                 ce = best_ce_loss(preds, scores, vlen)
                 loss = reg + margin_weight * kl + ce_weight * ce
