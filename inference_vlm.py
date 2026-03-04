@@ -8,12 +8,12 @@ fine-tuned Qwen VLM that generates "Rating: X/10" text scores.
 import os
 import re
 import time
-import glob
 import yaml
 import requests
 import torch
 from PIL import Image
 from io import BytesIO
+from transformers import AutoProcessor
 
 
 PROMPT_TEXT = (
@@ -51,6 +51,10 @@ class VLMPropertyRanker:
             load_in_4bit=vlm_cfg.get("load_in_4bit", False),
         )
         FastVisionModel.for_inference(self.model)
+
+        # Load the processor for handling images + text together
+        base_model = vlm_cfg.get("base_model", "unsloth/Qwen3.5-0.8B")
+        self.processor = AutoProcessor.from_pretrained(base_model)
         print("VLM loaded successfully.")
 
     def _load_image(self, src: str) -> Image.Image:
@@ -80,7 +84,7 @@ class VLMPropertyRanker:
 
         return 5.0  # default fallback
 
-    def _score_image(self, image: Image.Image) -> float:
+    def _score_image(self, image: Image.Image) -> tuple:
         messages = [
             {
                 "role": "user",
@@ -91,14 +95,15 @@ class VLMPropertyRanker:
             }
         ]
 
+        # Use tokenizer for chat template, processor for image+text encoding
         input_text = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
-        inputs = self.tokenizer(
-            input_text,
+        inputs = self.processor(
+            text=[input_text],
+            images=[image],
             return_tensors="pt",
             padding=True,
-            truncation=True,
         ).to(self.model.device)
 
         with torch.no_grad():
@@ -111,7 +116,8 @@ class VLMPropertyRanker:
             )
 
         # Decode only new tokens
-        new_tokens = output_ids[0, inputs["input_ids"].shape[1]:]
+        prompt_len = inputs["input_ids"].shape[1]
+        new_tokens = output_ids[0, prompt_len:]
         response = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
         score = self._parse_rating(response)
         return score, response
