@@ -182,6 +182,14 @@ class RankingHead(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
+        # Zero-init the attention output projection so attn_out=0 at epoch 0.
+        # The residual x + attn_out = x initially → identical to the old
+        # independent MLP head. Attention activates gradually as it learns
+        # meaningful cross-image comparisons. Without this, random attention
+        # corrupts backbone features and causes a performance drop.
+        nn.init.zeros_(self.attn.out_proj.weight)
+        nn.init.zeros_(self.attn.out_proj.bias)
+
     def forward(self, x, valid_lens=None):
         # x: (B, G, in_dim)
         B, G, _ = x.shape
