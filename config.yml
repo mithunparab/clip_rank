@@ -20,18 +20,16 @@ model:
   unfreeze_last: 200
 
 train:
-  batch_size: 2
-  lr_head: 0.0002
-  lr_backbone: 0.000001
+  batch_size: 32
+  lr_head: 0.0003
+  lr_backbone: 0.000002
   epochs: 50
   weight_decay: 0.01
   grad_clip: 1.0
   seed: 42
   save_dir: "checkpoints"
   patience: 20
-  # GoldSet + Plackett-Luce losses
-  temperature: 1.0       # PL prediction temperature (1.0 = standard)
-  margin_weight: 0.3     # weight for PL ranking loss
-  warmup_epochs: 5
-  gradient_accumulation_steps: 4
-  use_cached_features: false
+  warmup_epochs: 3
+  gradient_accumulation_steps: 2
+  # Ordinal (CORAL) training
+  gold_weight: 3.0       # extra weight on gold-tier thresholds (7, 8, 9)

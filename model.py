@@ -155,6 +155,153 @@ class BirderBackboneWrapper(nn.Module):
         return self.net(x)
 
 
+def _build_backbone(cfg):
+    """Shared backbone construction for all ranker variants."""
+    name = cfg.model.name.lower()
+    if name not in VARIANTS:
+        raise ValueError(f"Unknown model '{name}'. Choose from: {list(VARIANTS.keys())}")
+
+    v = VARIANTS[name]
+    print(f"Initializing {name} backbone...")
+
+    if v["loader"] == "transformers_clip":
+        from transformers import CLIPVisionModel
+        vision_model = CLIPVisionModel.from_pretrained(v["repo"])
+        backbone = HFBackboneWrapper(vision_model)
+    elif v["loader"] == "transformers":
+        from transformers import AutoModel
+        hf_model = AutoModel.from_pretrained(v["repo"])
+        backbone = HFBackboneWrapper(hf_model)
+    elif v["loader"] == "open_clip_hub":
+        model, _, _ = open_clip.create_model_and_transforms(v["arch"], pretrained=v["pretrained"])
+        backbone = model.visual
+    elif v["loader"] == "pixio":
+        from transformers import AutoModel
+        hf_model = AutoModel.from_pretrained(v["repo"])
+        backbone = PixioBackboneWrapper(hf_model)
+    elif v["loader"] == "birder":
+        import birder
+        from pathlib import Path
+        models_dir = Path("models")
+        if models_dir.exists() and not models_dir.is_dir():
+            models_dir.unlink()
+        models_dir.mkdir(parents=True, exist_ok=True)
+        net, _ = birder.load_pretrained_model(v["birder_name"], inference=True)
+        backbone = BirderBackboneWrapper(net)
+    elif v["loader"] == "open_clip":
+        ckpt_path = hf_hub_download(repo_id=v["repo"], filename=v["file"])
+        model, _, _ = open_clip.create_model_and_transforms(v["arch"], pretrained=ckpt_path)
+        backbone = model.visual
+    else:
+        import mobileclip
+        ckpt_path = hf_hub_download(repo_id=v["repo"], filename=v["file"])
+        model, _, _ = mobileclip.create_model_and_transforms(v["arch"], pretrained=ckpt_path)
+        backbone = model.image_encoder
+
+    # Auto-detect backbone output dim
+    img_size = getattr(cfg.data, "img_size", 224)
+    with torch.no_grad():
+        dummy = torch.zeros(1, 3, img_size, img_size)
+        backbone_dim = backbone(dummy).shape[-1]
+    print(f"  backbone_dim={backbone_dim}")
+
+    # Freeze all, then unfreeze last N params
+    backbone.eval()
+    for param in backbone.parameters():
+        param.requires_grad = False
+
+    unfreeze = getattr(cfg.model, "unfreeze_last", 60)
+    params_to_train = list(backbone.named_parameters())[-unfreeze:]
+    for pname, param in params_to_train:
+        param.requires_grad = True
+
+    return backbone, backbone_dim
+
+
+def _find_unfrozen_modules(backbone):
+    """Find the highest-level backbone submodules containing unfrozen params."""
+    unfrozen = set()
+    for name, param in backbone.named_parameters():
+        if param.requires_grad:
+            top = name.split('.')[0]
+            child = getattr(backbone, top, None)
+            if child is not None and isinstance(child, nn.Module):
+                unfrozen.add(child)
+    return list(unfrozen)
+
+
+class OrdinalHead(nn.Module):
+    """CORAL ordinal regression head.
+
+    Shared linear weights with per-threshold biases.
+    Score = sum(sigmoid(logits)) gives a continuous ranking score in [0, K].
+
+    Thresholds at every integer from -9 to 9 (K=19).
+    A score-10 image fires all 19 sigmoids; a score-(-10) fires none.
+    Gold-tier boundaries (7, 8, 9) are upweighted in the loss to
+    ensure fine-grained ordering within the hero tier.
+    """
+    def __init__(self, in_dim, num_thresholds=19, hidden_dim=256, dropout=0.1):
+        super().__init__()
+        self.num_thresholds = num_thresholds
+        self.proj = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        # CORAL: shared linear projection + per-threshold bias
+        self.linear = nn.Linear(hidden_dim, 1, bias=False)
+        self.biases = nn.Parameter(torch.zeros(num_thresholds))
+
+    def forward(self, x):
+        """x: (B, in_dim) -> (B, K) logits"""
+        h = self.proj(x)
+        return self.linear(h) + self.biases  # (B, K) via broadcast
+
+
+class OrdinalRanker(nn.Module):
+    """Pointwise ordinal regression ranker using CORAL."""
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.backbone, self.backbone_dim = _build_backbone(cfg)
+        self._unfrozen_modules = _find_unfrozen_modules(self.backbone)
+
+        num_thresholds = getattr(cfg.model, "num_thresholds", 19)
+        head_hidden = getattr(cfg.model, "head_hidden_dim", 256)
+        head_dropout = getattr(cfg.model, "head_dropout", 0.1)
+        self.head = OrdinalHead(self.backbone_dim, num_thresholds, head_hidden, head_dropout)
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.backbone.eval()
+        if mode:
+            for module in self._unfrozen_modules:
+                module.train()
+                for sub in module.modules():
+                    if isinstance(sub, (nn.LayerNorm, nn.BatchNorm2d, nn.GroupNorm)):
+                        sub.eval()
+        return self
+
+    def forward(self, x):
+        """x: (B, C, H, W) or (B, G, C, H, W) -> logits"""
+        if x.dim() == 5:
+            b, g, c, h, w = x.shape
+            x = x.view(b * g, c, h, w)
+            features = self.backbone(x)
+            logits = self.head(features)
+            return logits.view(b, g, -1)  # (B, G, K)
+        else:
+            features = self.backbone(x)
+            return self.head(features)  # (B, K)
+
+    def score(self, x):
+        """Continuous ranking score = sum of sigmoid(logits)."""
+        logits = self.forward(x)
+        return torch.sigmoid(logits).sum(dim=-1)  # (B,) or (B, G)
+
+
 class RankingHead(nn.Module):
     """Cross-image self-attention + MLP head.
 
@@ -213,84 +360,12 @@ class RankingHead(nn.Module):
 class MobileCLIPRanker(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-
-        name = cfg.model.name.lower()
-        if name not in VARIANTS:
-            raise ValueError(f"Unknown model '{name}'. Choose from: {list(VARIANTS.keys())}")
-
-        v = VARIANTS[name]
-        print(f"Initializing {name} backbone...")
-
-        if v["loader"] == "transformers_clip":
-            from transformers import CLIPVisionModel
-            vision_model = CLIPVisionModel.from_pretrained(v["repo"])
-            self.backbone = HFBackboneWrapper(vision_model)
-        elif v["loader"] == "transformers":
-            from transformers import AutoModel
-            hf_model = AutoModel.from_pretrained(v["repo"])
-            self.backbone = HFBackboneWrapper(hf_model)
-        elif v["loader"] == "open_clip_hub":
-            # Standard OpenCLIP models — downloads pretrained weights automatically
-            model, _, _ = open_clip.create_model_and_transforms(v["arch"], pretrained=v["pretrained"])
-            self.backbone = model.visual
-        elif v["loader"] == "pixio":
-            from transformers import AutoModel
-            hf_model = AutoModel.from_pretrained(v["repo"])
-            self.backbone = PixioBackboneWrapper(hf_model)
-        elif v["loader"] == "birder":
-            import birder
-            from pathlib import Path
-            # Ensure birder's model cache dir exists as a directory
-            models_dir = Path("models")
-            if models_dir.exists() and not models_dir.is_dir():
-                models_dir.unlink()
-            models_dir.mkdir(parents=True, exist_ok=True)
-            net, _ = birder.load_pretrained_model(v["birder_name"], inference=True)
-            self.backbone = BirderBackboneWrapper(net)
-        elif v["loader"] == "open_clip":
-            ckpt_path = hf_hub_download(repo_id=v["repo"], filename=v["file"])
-            model, _, _ = open_clip.create_model_and_transforms(v["arch"], pretrained=ckpt_path)
-            self.backbone = model.visual
-        else:
-            import mobileclip
-            ckpt_path = hf_hub_download(repo_id=v["repo"], filename=v["file"])
-            model, _, _ = mobileclip.create_model_and_transforms(v["arch"], pretrained=ckpt_path)
-            self.backbone = model.image_encoder
-
-        # Auto-detect backbone output dim instead of trusting registry
-        img_size = getattr(cfg.data, "img_size", 224)
-        with torch.no_grad():
-            dummy = torch.zeros(1, 3, img_size, img_size)
-            self.backbone_dim = self.backbone(dummy).shape[-1]
-        print(f"  backbone_dim={self.backbone_dim}")
-
-        self.backbone.eval()
-        for param in self.backbone.parameters():
-            param.requires_grad = False
-
-        unfreeze = getattr(cfg.model, "unfreeze_last", 60)
-        params_to_train = list(self.backbone.named_parameters())[-unfreeze:]
-        for pname, param in params_to_train:
-            param.requires_grad = True
-
-        # Track parent modules of unfrozen params so train() can re-enable dropout
-        self._unfrozen_modules = self._find_unfrozen_modules()
+        self.backbone, self.backbone_dim = _build_backbone(cfg)
+        self._unfrozen_modules = _find_unfrozen_modules(self.backbone)
 
         head_hidden = getattr(cfg.model, "head_hidden_dim", 256)
         head_dropout = getattr(cfg.model, "head_dropout", 0.1)
         self.head = RankingHead(self.backbone_dim, head_hidden, head_dropout)
-
-    def _find_unfrozen_modules(self):
-        """Find the highest-level backbone submodules containing unfrozen params."""
-        unfrozen = set()
-        for name, param in self.backbone.named_parameters():
-            if param.requires_grad:
-                # Walk up to the top-level child of backbone
-                top = name.split('.')[0]
-                child = getattr(self.backbone, top, None)
-                if child is not None and isinstance(child, nn.Module):
-                    unfrozen.add(child)
-        return list(unfrozen)
 
     def train(self, mode=True):
         super().train(mode)
