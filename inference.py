@@ -9,7 +9,7 @@ from io import BytesIO
 from types import SimpleNamespace
 from torchvision import transforms
 import numpy as np
-from model import MobileCLIPRanker, get_norm_stats
+from model import MobileCLIPRanker, OrdinalRanker, get_norm_stats
 
 def load_config(path="config.yml"):
     with open(path, 'r') as f:
@@ -30,13 +30,10 @@ class PropertyRanker:
         print(f"--- Loading Ranker ---")
         print(f"Device: {self.device}")
         
-        # 1. Init Architecture
-        self.model = MobileCLIPRanker(self.cfg)
-        
-        # 2. Load Weights (DDP Safe)
+        # 1. Detect model type from checkpoint
         print(f"Loading Weights: {model_path}")
         checkpoint = torch.load(model_path, map_location=self.device)
-        
+
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
             state_dict = checkpoint['model_state_dict']
         else:
@@ -45,9 +42,17 @@ class PropertyRanker:
         # Strip 'module.' prefix if trained with DDP
         new_state_dict = {}
         for k, v in state_dict.items():
-            name = k.replace("module.", "")
-            new_state_dict[name] = v
-        
+            new_state_dict[k.replace("module.", "")] = v
+
+        # Auto-detect: ordinal model has head.biases, ranking model has head.attn
+        self.is_ordinal = any('head.biases' in k for k in new_state_dict)
+
+        if self.is_ordinal:
+            print("Detected ordinal (CORAL) model")
+            self.model = OrdinalRanker(self.cfg)
+        else:
+            self.model = MobileCLIPRanker(self.cfg)
+
         self.model.load_state_dict(new_state_dict)
         self.model.to(self.device)
         self.model.eval()
@@ -90,13 +95,16 @@ class PropertyRanker:
         if not valid_tensors:
             return []
 
-        # Batch Inference
-        batch = torch.stack(valid_tensors).unsqueeze(0).to(self.device)
-        valid_len = torch.tensor([len(valid_tensors)]).to(self.device)
-        
         with torch.no_grad():
-            # Get raw logits (No Sigmoid/Softmax needed for sorting)
-            raw_scores = self.model(batch, valid_lens=valid_len).view(-1).cpu().numpy()
+            if self.is_ordinal:
+                # Pointwise: score each image independently
+                batch = torch.stack(valid_tensors).to(self.device)  # (N, C, H, W)
+                raw_scores = self.model.score(batch).cpu().numpy()
+            else:
+                # Group-based ranking model
+                batch = torch.stack(valid_tensors).unsqueeze(0).to(self.device)
+                valid_len = torch.tensor([len(valid_tensors)]).to(self.device)
+                raw_scores = self.model(batch, valid_lens=valid_len).view(-1).cpu().numpy()
             
         results = []
         for i, score in enumerate(raw_scores):
