@@ -53,25 +53,14 @@ def build_threshold_weights(gold_weight=5.0):
     return weights
 
 
-def coral_loss(logits, ordinal_labels, threshold_weights, device, focal_gamma=2.0):
+def coral_loss(logits, ordinal_labels, threshold_weights, device):
     """
-    Focal ordinal loss — weighted BCE with focal modulation.
-
-    Focal factor (1 - p_t)^gamma down-weights easy examples (confident
-    negatives like score -10) and focuses gradient on hard boundary
-    cases (score 5-6 vs 7) where the model is uncertain.
+    Weighted binary cross-entropy across all thresholds.
+    logits: (B, K), ordinal_labels: (B, K), threshold_weights: (K,)
     """
     w = threshold_weights.to(device)
-    # Standard BCE per element
-    bce = F.binary_cross_entropy_with_logits(logits, ordinal_labels, reduction='none')  # (B, K)
-
-    # Focal modulation: down-weight easy examples
-    with torch.no_grad():
-        probs = torch.sigmoid(logits)
-        p_t = probs * ordinal_labels + (1 - probs) * (1 - ordinal_labels)
-        focal_weight = (1 - p_t) ** focal_gamma
-
-    loss = (bce * focal_weight * w).mean()
+    loss = F.binary_cross_entropy_with_logits(logits, ordinal_labels, reduction='none')  # (B, K)
+    loss = (loss * w).mean()
     return loss
 
 
@@ -195,7 +184,6 @@ def main():
 
     # Config
     gold_weight = getattr(cfg.train, 'gold_weight', 5.0)
-    focal_gamma = getattr(cfg.train, 'focal_gamma', 2.0)
     accum_steps = getattr(cfg.train, 'gradient_accumulation_steps', 4)
     warmup_epochs = getattr(cfg.train, 'warmup_epochs', 3)
 
@@ -291,7 +279,7 @@ def main():
             if use_amp:
                 with torch.amp.autocast("cuda"):
                     logits = model(images)  # (B, K)
-                    loss = coral_loss(logits, ordinal_labels, threshold_weights, device, focal_gamma)
+                    loss = coral_loss(logits, ordinal_labels, threshold_weights, device)
                     loss = loss / accum_steps
 
                 scaler.scale(loss).backward()
@@ -304,7 +292,7 @@ def main():
                     optimizer.zero_grad(set_to_none=True)
             else:
                 logits = model(images)
-                loss = coral_loss(logits, ordinal_labels, threshold_weights, device, focal_gamma)
+                loss = coral_loss(logits, ordinal_labels, threshold_weights, device)
                 loss = loss / accum_steps
 
                 loss.backward()
