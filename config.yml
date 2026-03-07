@@ -32,4 +32,5 @@ train:
   warmup_epochs: 3
   gradient_accumulation_steps: 2
   # Ordinal (CORAL) training
-  gold_weight: 3.0       # extra weight on gold-tier thresholds (7, 8, 9)
+  gold_weight: 5.0       # extra weight on gold-tier thresholds (7, 8, 9)
+  focal_gamma: 2.0       # focal loss gamma — higher = more focus on hard examples
