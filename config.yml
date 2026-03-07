@@ -22,7 +22,7 @@ model:
 train:
   batch_size: 32
   lr_head: 0.0003
-  lr_backbone: 0.000002
+  lr_backbone: 0.000005
   epochs: 50
   weight_decay: 0.01
   grad_clip: 1.0
@@ -33,4 +33,4 @@ train:
   gradient_accumulation_steps: 2
   # Ordinal (CORAL) training
   gold_weight: 5.0       # extra weight on gold-tier thresholds (7, 8, 9)
-  focal_gamma: 2.0       # focal loss gamma — higher = more focus on hard examples
+  focal_gamma: 1.0       # focal loss gamma — mild focus on hard boundary cases
