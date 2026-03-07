@@ -44,7 +44,7 @@ def cleanup_ddp():
         dist.destroy_process_group()
 
 
-def build_threshold_weights(gold_weight=5.0):
+def build_threshold_weights(gold_weight=3.0):
     """Per-threshold loss weights. Gold-tier thresholds (7, 8, 9) get upweighted."""
     weights = torch.ones(NUM_THRESHOLDS)
     for i, t in enumerate(THRESHOLDS):
@@ -183,7 +183,7 @@ def main():
     os.makedirs(cfg.train.save_dir, exist_ok=True)
 
     # Config
-    gold_weight = getattr(cfg.train, 'gold_weight', 5.0)
+    gold_weight = getattr(cfg.train, 'gold_weight', 3.0)
     accum_steps = getattr(cfg.train, 'gradient_accumulation_steps', 4)
     warmup_epochs = getattr(cfg.train, 'warmup_epochs', 3)
 
