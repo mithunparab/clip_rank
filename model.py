@@ -231,11 +231,12 @@ def _find_unfrozen_modules(backbone):
 
 
 class OrdinalHead(nn.Module):
-    """Independent ordinal regression head.
+    """CORAL ordinal regression head.
 
-    Each threshold gets its own classifier (shared feature projection,
-    independent output weights). More capacity than strict CORAL which
-    uses a single shared weight vector.
+    Shared linear weights with per-threshold biases enforce ordinal
+    consistency: P(score > k) >= P(score > k+1) is guaranteed because
+    all thresholds share the same projection direction, differing only
+    in bias (intercept).
 
     Score = sum(sigmoid(logits)) gives a continuous ranking score in [0, K].
     """
@@ -248,13 +249,14 @@ class OrdinalHead(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout),
         )
-        # Independent classifier per threshold — more capacity than shared CORAL
-        self.classifiers = nn.Linear(hidden_dim, num_thresholds)
+        # CORAL: shared linear projection + per-threshold bias
+        self.linear = nn.Linear(hidden_dim, 1, bias=False)
+        self.biases = nn.Parameter(torch.zeros(num_thresholds))
 
     def forward(self, x):
         """x: (B, in_dim) -> (B, K) logits"""
         h = self.proj(x)
-        return self.classifiers(h)  # (B, K)
+        return self.linear(h) + self.biases  # (B, K) via broadcast
 
 
 class OrdinalRanker(nn.Module):
