@@ -9,7 +9,7 @@ from io import BytesIO
 from types import SimpleNamespace
 from torchvision import transforms
 import numpy as np
-from model import MobileCLIPRanker, OrdinalRanker, get_norm_stats
+from model import MobileCLIPRanker, OrdinalRanker, LDLRanker, get_norm_stats
 
 def load_config(path="config.yml"):
     with open(path, 'r') as f:
@@ -44,10 +44,14 @@ class PropertyRanker:
         for k, v in state_dict.items():
             new_state_dict[k.replace("module.", "")] = v
 
-        # Auto-detect: ordinal model has head.biases, ranking model has head.attn
+        # Auto-detect model type from checkpoint keys
         self.is_ordinal = any('head.biases' in k for k in new_state_dict)
+        self.is_ldl = any('score_values' in k for k in new_state_dict)
 
-        if self.is_ordinal:
+        if self.is_ldl:
+            print("Detected LDL model")
+            self.model = LDLRanker(self.cfg)
+        elif self.is_ordinal:
             print("Detected ordinal (CORAL) model")
             self.model = OrdinalRanker(self.cfg)
         else:
@@ -96,7 +100,7 @@ class PropertyRanker:
             return []
 
         with torch.no_grad():
-            if self.is_ordinal:
+            if self.is_ldl or self.is_ordinal:
                 # Pointwise: score each image independently
                 batch = torch.stack(valid_tensors).to(self.device)  # (N, C, H, W)
                 raw_scores = self.model.score(batch).cpu().numpy()
