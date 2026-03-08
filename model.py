@@ -248,6 +248,9 @@ class OrdinalHead(nn.Module):
             nn.Linear(in_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
         )
         # CORAL: shared linear projection + per-threshold bias
         self.linear = nn.Linear(hidden_dim, 1, bias=False)

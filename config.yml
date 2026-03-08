@@ -14,9 +14,9 @@ data:
 
 model:
   # mobileclip2_l14 | clip_vit_l14 | metaclip2_l14 | vit_b16 | etc.
-  name: "clip_vit_l14"
-  head_hidden_dim: 256
-  head_dropout: 0.1
+  name: "mobileclip2_l14"
+  head_hidden_dim: 512
+  head_dropout: 0.15
   unfreeze_last: 200
 
 train:
