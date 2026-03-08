@@ -301,6 +301,83 @@ class OrdinalRanker(nn.Module):
         return torch.sigmoid(logits).sum(dim=-1)  # (B,) or (B, G)
 
 
+# ---- Label Distribution Learning (LDL) ----
+
+# Score values: -10, -9, ..., 10 (21 bins)
+SCORE_VALUES = torch.arange(-10, 11, dtype=torch.float32)  # (21,)
+NUM_BINS = 21
+
+
+class LDLHead(nn.Module):
+    """Label Distribution Learning head.
+
+    Predicts a probability distribution over 21 score bins (-10 to 10).
+    Final ranking score = expected value = sum(score_k * P(score_k)).
+    """
+    def __init__(self, in_dim, num_bins=21, hidden_dim=256, dropout=0.1):
+        super().__init__()
+        self.num_bins = num_bins
+        self.net = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_bins),
+        )
+
+    def forward(self, x):
+        """x: (B, in_dim) -> (B, 21) raw logits"""
+        return self.net(x)
+
+
+class LDLRanker(nn.Module):
+    """Pointwise Label Distribution Learning ranker.
+
+    Predicts a full probability distribution over score values.
+    Trained with KL divergence against Gaussian soft targets.
+    """
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.backbone, self.backbone_dim = _build_backbone(cfg)
+        self._unfrozen_modules = _find_unfrozen_modules(self.backbone)
+
+        head_hidden = getattr(cfg.model, "head_hidden_dim", 256)
+        head_dropout = getattr(cfg.model, "head_dropout", 0.1)
+        self.head = LDLHead(self.backbone_dim, NUM_BINS, head_hidden, head_dropout)
+        # Register score values as buffer so they move with the model
+        self.register_buffer('score_values', SCORE_VALUES.clone())
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.backbone.eval()
+        if mode:
+            for module in self._unfrozen_modules:
+                module.train()
+                for sub in module.modules():
+                    if isinstance(sub, (nn.LayerNorm, nn.BatchNorm2d, nn.GroupNorm)):
+                        sub.eval()
+        return self
+
+    def forward(self, x):
+        """x: (B, C, H, W) or (B, G, C, H, W) -> (B, 21) or (B, G, 21) logits"""
+        if x.dim() == 5:
+            b, g, c, h, w = x.shape
+            x = x.view(b * g, c, h, w)
+            features = self.backbone(x)
+            logits = self.head(features)
+            return logits.view(b, g, -1)
+        else:
+            features = self.backbone(x)
+            return self.head(features)
+
+    def score(self, x):
+        """Expected value: sum(score_k * P(score_k)) -> continuous ranking score."""
+        logits = self.forward(x)
+        probs = torch.softmax(logits, dim=-1)
+        return (probs * self.score_values).sum(dim=-1)
+
+
 class RankingHead(nn.Module):
     """Cross-image self-attention + MLP head.
 
