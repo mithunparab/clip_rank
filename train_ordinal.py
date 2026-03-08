@@ -84,18 +84,54 @@ def compute_ndcg(pred_scores, gt_scores):
     return dcg / idcg
 
 
-def validate(model, df_val, cfg, device):
-    """Group-level validation: score images individually, evaluate ranking per group."""
+def validate(model, df_val, cfg, device, tta=True):
+    """Group-level validation with optional TTA (5 crops + flips = 10 views)."""
     from torchvision import transforms
+    from PIL import Image
 
     model.eval()
     norm_mean, norm_std = get_norm_stats(cfg.model.name)
-    process = transforms.Compose([
-        transforms.Resize(cfg.data.img_size, interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.CenterCrop(cfg.data.img_size),
+    img_size = cfg.data.img_size
+
+    # Standard center crop
+    center_crop = transforms.Compose([
+        transforms.Resize(img_size, interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.CenterCrop(img_size),
         transforms.ToTensor(),
         transforms.Normalize(mean=norm_mean, std=norm_std)
     ])
+
+    # TTA: 5 crops (center + 4 corners) x 2 (original + hflip) = 10 views
+    def tta_transforms(pil_img):
+        views = []
+        w, h = pil_img.size
+        crop_size = min(w, h)
+        # Resize so short side = img_size * 1.14 (standard 5-crop ratio)
+        resize_size = int(img_size * 1.143)
+        resized = transforms.functional.resize(
+            pil_img, resize_size,
+            interpolation=transforms.InterpolationMode.BICUBIC
+        )
+        rw, rh = resized.size
+
+        # 5 crop positions: center, top-left, top-right, bottom-left, bottom-right
+        crops = [
+            transforms.functional.center_crop(resized, img_size),
+            transforms.functional.crop(resized, 0, 0, img_size, img_size),
+            transforms.functional.crop(resized, 0, rw - img_size, img_size, img_size),
+            transforms.functional.crop(resized, rh - img_size, 0, img_size, img_size),
+            transforms.functional.crop(resized, rh - img_size, rw - img_size, img_size, img_size),
+        ]
+
+        to_tensor = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=norm_mean, std=norm_std)
+        ])
+
+        for crop in crops:
+            views.append(to_tensor(crop))
+            views.append(to_tensor(transforms.functional.hflip(crop)))
+        return views  # 10 tensors
 
     if 'file_path' not in df_val.columns:
         df_val = df_val.copy()
@@ -112,25 +148,36 @@ def validate(model, df_val, cfg, device):
             if len(group) < 2:
                 continue
 
-            images, scores = [], []
+            all_scores_list, gt_scores = [], []
             for _, row in group.iterrows():
                 if not os.path.exists(row['file_path']):
                     continue
                 try:
-                    from PIL import Image
                     with Image.open(row['file_path']) as img:
-                        images.append(process(img.convert('RGB')))
-                    scores.append(float(row['score']))
+                        pil = img.convert('RGB')
+                        if tta:
+                            views = tta_transforms(pil)
+                        else:
+                            views = [center_crop(pil)]
+                        all_scores_list.append(views)
+                    gt_scores.append(float(row['score']))
                 except Exception:
                     continue
 
-            if len(images) < 2:
+            if len(all_scores_list) < 2:
                 continue
 
-            batch = torch.stack(images).to(device)  # (N, C, H, W)
-            logits = model(batch)  # (N, K)
-            pred_scores = ordinal_score(logits).cpu().numpy()
-            gt_arr = np.array(scores)
+            # Score each image (average across TTA views)
+            pred_scores_list = []
+            for views in all_scores_list:
+                batch = torch.stack(views).to(device)
+                logits = model(batch)  # (num_views, K)
+                # Average ordinal scores across views
+                view_scores = ordinal_score(logits)  # (num_views,)
+                pred_scores_list.append(view_scores.mean().item())
+
+            pred_scores = np.array(pred_scores_list)
+            gt_arr = np.array(gt_scores)
 
             # Gold accuracy
             if gt_arr.max() >= 7:
