@@ -13,8 +13,8 @@ data:
   cached_features_dir: "cached_features"
 
 model:
-  # mobileclip2_s0 | mobileclip2_s3 | mobileclip2_b | mobileclip2_l14
-  name: "mobileclip2_l14"
+  # mobileclip2_l14 | clip_vit_l14 | metaclip2_l14 | vit_b16 | etc.
+  name: "clip_vit_l14"
   head_hidden_dim: 256
   head_dropout: 0.1
   unfreeze_last: 200
@@ -31,6 +31,5 @@ train:
   patience: 20
   warmup_epochs: 3
   gradient_accumulation_steps: 2
-  # LDL training
-  ldl_sigma: 1.0         # Gaussian width for non-gold scores
-  ldl_gold_sigma: 0.5    # tighter Gaussian for gold tier (score >= 7)
+  # Ordinal (CORAL) training
+  gold_weight: 3.0       # extra weight on gold-tier thresholds (7, 8, 9)
