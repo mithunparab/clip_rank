@@ -43,15 +43,23 @@ def cleanup_ddp():
         dist.destroy_process_group()
 
 
-def ldl_loss(logits, target_dist):
-    """KL divergence: D_KL(target || predicted).
+def ldl_loss(logits, target_dist, scores=None, gold_weight=3.0):
+    """KL divergence: D_KL(target || predicted), with per-sample gold weighting.
 
     target_dist: (B, 21) soft Gaussian targets (already normalized)
     logits: (B, 21) raw model output (pre-softmax)
+    scores: (B,) raw scores for weighting — gold (>=7) gets upweighted
     """
     log_pred = F.log_softmax(logits, dim=-1)
-    # KL(target || pred) = sum(target * (log(target) - log(pred)))
-    loss = F.kl_div(log_pred, target_dist, reduction='batchmean')
+    # Per-sample KL
+    per_sample = F.kl_div(log_pred, target_dist, reduction='none').sum(dim=-1)  # (B,)
+
+    if scores is not None:
+        weights = torch.ones_like(per_sample)
+        weights[scores >= 7] = gold_weight
+        loss = (per_sample * weights).mean()
+    else:
+        loss = per_sample.mean()
     return loss
 
 
@@ -181,13 +189,19 @@ def main():
     if 'file_path' not in df.columns:
         df['file_path'] = df.index.map(lambda x: os.path.join('images', f"{x}.jpg"))
 
+    # Shuffle groups before splitting so gold is evenly distributed
     unique_groups = df['group_id'].unique()
+    rng = np.random.RandomState(seed)
+    rng.shuffle(unique_groups)
     val_groups = set(unique_groups[:int(len(unique_groups) * 0.1)])
     train_df = df[~df['group_id'].isin(val_groups)].copy()
     val_df = df[df['group_id'].isin(val_groups)].copy()
 
     if rank == 0:
-        print(f"Train: {len(train_df)} images | Val: {len(val_df)} images ({len(val_groups)} groups)")
+        n_train_gold = (train_df['score'] >= 7).sum()
+        n_val_gold_groups = val_df[val_df['score'] >= 7]['group_id'].nunique()
+        print(f"Train: {len(train_df)} images ({n_train_gold} gold) | "
+              f"Val: {len(val_df)} images ({len(val_groups)} groups, {n_val_gold_groups} with gold)")
 
     norm_mean, norm_std = get_norm_stats(cfg.model.name)
     train_ds = LDLImageDataset(
@@ -196,11 +210,20 @@ def main():
         sigma=sigma, gold_sigma=gold_sigma,
     )
 
-    sampler = DistributedSampler(train_ds, shuffle=True, seed=seed) if dist.is_initialized() else None
+    # Weighted sampling: oversample gold images so model sees them more
+    gold_weight_sample = getattr(cfg.train, 'gold_weight', 3.0)
+    if dist.is_initialized():
+        sampler = DistributedSampler(train_ds, shuffle=True, seed=seed)
+    else:
+        sample_weights = []
+        for r in train_ds.records:
+            sample_weights.append(gold_weight_sample if r['score'] >= 7 else 1.0)
+        sampler = torch.utils.data.WeightedRandomSampler(
+            sample_weights, num_samples=len(sample_weights), replacement=True
+        )
 
     train_loader = DataLoader(
         train_ds, batch_size=cfg.train.batch_size, sampler=sampler,
-        shuffle=(sampler is None),
         num_workers=cfg.system.num_workers,
         pin_memory=cfg.system.pin_memory,
         drop_last=True,
@@ -258,14 +281,15 @@ def main():
         iterator = tqdm(train_loader, desc=f"Epoch {epoch+1}") if rank == 0 else train_loader
         optimizer.zero_grad(set_to_none=True)
 
-        for step, (images, target_dist, _scores) in enumerate(iterator):
+        for step, (images, target_dist, scores_batch) in enumerate(iterator):
             images = images.to(device)
             target_dist = target_dist.to(device)
+            scores_batch = scores_batch.to(device)
 
             if use_amp:
                 with torch.amp.autocast("cuda"):
                     logits = model(images)
-                    loss = ldl_loss(logits, target_dist)
+                    loss = ldl_loss(logits, target_dist, scores_batch, gold_weight_sample)
                     loss = loss / accum_steps
 
                 scaler.scale(loss).backward()
@@ -278,7 +302,7 @@ def main():
                     optimizer.zero_grad(set_to_none=True)
             else:
                 logits = model(images)
-                loss = ldl_loss(logits, target_dist)
+                loss = ldl_loss(logits, target_dist, scores_batch, gold_weight_sample)
                 loss = loss / accum_steps
 
                 loss.backward()

@@ -70,4 +70,4 @@ class LDLImageDataset(Dataset):
 
         score = float(r['score'])
         target_dist = make_target_distribution(score, self.sigma, self.gold_sigma)
-        return tensor, torch.from_numpy(target_dist), score
+        return tensor, torch.from_numpy(target_dist), torch.tensor(score, dtype=torch.float32)
