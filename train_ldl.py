@@ -23,7 +23,7 @@ import numpy as np
 from tqdm import tqdm
 from scipy.stats import spearmanr
 
-from dataset_ldl import LDLImageDataset, SCORE_VALUES, NUM_BINS
+from dataset_ldl import LDLImageDataset, BIN_CENTERS, NUM_BINS
 from model import LDLRanker, get_norm_stats
 from utils import load_config
 
