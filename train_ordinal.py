@@ -239,14 +239,19 @@ def main():
     if 'file_path' not in df.columns:
         df['file_path'] = df.index.map(lambda x: os.path.join('images', f"{x}.jpg"))
 
-    # Split by group_id so validation groups are unseen
+    # Shuffle groups before splitting so gold is evenly distributed
     unique_groups = df['group_id'].unique()
+    rng = np.random.RandomState(seed)
+    rng.shuffle(unique_groups)
     val_groups = set(unique_groups[:int(len(unique_groups) * 0.1)])
     train_df = df[~df['group_id'].isin(val_groups)].copy()
     val_df = df[df['group_id'].isin(val_groups)].copy()
 
     if rank == 0:
-        print(f"Train: {len(train_df)} images | Val: {len(val_df)} images ({len(val_groups)} groups)")
+        n_train_gold = (train_df['score'] >= 7).sum()
+        n_val_gold_groups = val_df[val_df['score'] >= 7]['group_id'].nunique()
+        print(f"Train: {len(train_df)} images ({n_train_gold} gold) | "
+              f"Val: {len(val_df)} images ({len(val_groups)} groups, {n_val_gold_groups} with gold)")
 
     norm_mean, norm_std = get_norm_stats(cfg.model.name)
     train_ds = OrdinalImageDataset(
@@ -254,11 +259,19 @@ def main():
         img_size=cfg.data.img_size, norm_mean=norm_mean, norm_std=norm_std
     )
 
-    sampler = DistributedSampler(train_ds, shuffle=True, seed=seed) if dist.is_initialized() else None
+    # Weighted sampling: oversample gold images
+    if dist.is_initialized():
+        sampler = DistributedSampler(train_ds, shuffle=True, seed=seed)
+    else:
+        sample_weights = []
+        for r in train_ds.records:
+            sample_weights.append(gold_weight if r['score'] >= 7 else 1.0)
+        sampler = torch.utils.data.WeightedRandomSampler(
+            sample_weights, num_samples=len(sample_weights), replacement=True
+        )
 
     train_loader = DataLoader(
         train_ds, batch_size=cfg.train.batch_size, sampler=sampler,
-        shuffle=(sampler is None),
         num_workers=cfg.system.num_workers,
         pin_memory=cfg.system.pin_memory,
         drop_last=True,
