@@ -5,8 +5,7 @@ from huggingface_hub import hf_hub_download
 def download_dataset():
     repo_id = "fast-stager/property-labels"
     files = {
-        "annotations.csv": "annotations.csv",  # kept as source of labels, never overwritten
-        "verifications.csv": "verifications.csv",
+        "dataset.csv": "dataset.csv",
     }
 
     for filename, destination in files.items():
