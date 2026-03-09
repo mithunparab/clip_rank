@@ -327,7 +327,8 @@ def main():
         total_loss = 0.0
 
         if sampler is not None:
-            sampler.set_epoch(epoch)
+            if hasattr(sampler, 'set_epoch'):
+                sampler.set_epoch(epoch)
 
         iterator = tqdm(train_loader, desc=f"Epoch {epoch+1}") if rank == 0 else train_loader
         optimizer.zero_grad(set_to_none=True)
