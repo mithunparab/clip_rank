@@ -307,8 +307,8 @@ class OrdinalRanker(nn.Module):
 # ---- Label Distribution Learning (LDL) ----
 
 # Collapsed bins: 8 bins with ~900+ images each
-BIN_CENTERS = torch.tensor([-10, -9, -8, -4, 0, 2, 7, 9], dtype=torch.float32)
-NUM_BINS = 8
+BIN_CENTERS = torch.tensor([-10, -9, -8, -4, 0, 2, 8], dtype=torch.float32)
+NUM_BINS = 7
 
 
 class LDLHead(nn.Module):
