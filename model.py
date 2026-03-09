@@ -306,9 +306,9 @@ class OrdinalRanker(nn.Module):
 
 # ---- Label Distribution Learning (LDL) ----
 
-# Score values: -10, -9, ..., 10 (21 bins)
-SCORE_VALUES = torch.arange(-10, 11, dtype=torch.float32)  # (21,)
-NUM_BINS = 21
+# Collapsed bins: 8 bins with ~900+ images each
+BIN_CENTERS = torch.tensor([-10, -9, -8, -4, 0, 2, 7, 9], dtype=torch.float32)
+NUM_BINS = 8
 
 
 class LDLHead(nn.Module):
@@ -348,8 +348,8 @@ class LDLRanker(nn.Module):
         head_hidden = getattr(cfg.model, "head_hidden_dim", 256)
         head_dropout = getattr(cfg.model, "head_dropout", 0.1)
         self.head = LDLHead(self.backbone_dim, NUM_BINS, head_hidden, head_dropout)
-        # Register score values as buffer so they move with the model
-        self.register_buffer('score_values', SCORE_VALUES.clone())
+        # Register bin centers as buffer so they move with the model
+        self.register_buffer('score_values', BIN_CENTERS.clone())
 
     def train(self, mode=True):
         super().train(mode)
