@@ -13,11 +13,10 @@ BIN_EDGES = [
     (-8, -8),    # bin 2: poor (1601)
     (-7, -1),    # bin 3: below avg (902)
     (0, 0),      # bin 4: neutral (3320)
-    (1, 6),      # bin 5: above avg (1237: 24+1105+23+5+6+49+25)
-    (7, 7),      # bin 6: good (1439)
-    (8, 10),     # bin 7: gold (834)
+    (1, 6),      # bin 5: above avg (1237)
+    (7, 10),     # bin 6: gold (2273)
 ]
-BIN_CENTERS = np.array([-10, -9, -8, -4, 0, 2, 7, 9], dtype=np.float32)
+BIN_CENTERS = np.array([-10, -9, -8, -4, 0, 2, 8], dtype=np.float32)
 NUM_BINS = len(BIN_EDGES)
 
 
