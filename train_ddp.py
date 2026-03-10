@@ -299,6 +299,8 @@ def main():
         df['file_path'] = df.index.map(lambda x: os.path.join('images', f"{x}.jpg"))
 
     unique_groups = df['group_id'].unique()
+    rng = np.random.RandomState(seed)
+    rng.shuffle(unique_groups)
     val_groups = unique_groups[:int(len(unique_groups) * 0.1)]
     train_df = df[~df['group_id'].isin(val_groups)].copy()
     val_df = df[df['group_id'].isin(val_groups)].copy()
