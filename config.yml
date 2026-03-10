@@ -20,7 +20,7 @@ model:
   unfreeze_last: 200
 
 train:
-  batch_size: 32
+  batch_size: 8
   lr_head: 0.0003
   lr_backbone: 0.0000005
   epochs: 50
@@ -30,6 +30,6 @@ train:
   save_dir: "checkpoints"
   patience: 20
   warmup_epochs: 0
-  gradient_accumulation_steps: 2
+  gradient_accumulation_steps: 8
   # Ordinal (CORAL) training
   gold_weight: 3.0       # extra weight on gold-tier thresholds (7, 8, 9)
