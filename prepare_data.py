@@ -1,7 +1,9 @@
 import pandas as pd
 import requests
+import shutil
 import os
 from concurrent.futures import ThreadPoolExecutor
+from huggingface_hub import hf_hub_download
 from tqdm import tqdm
 
 
@@ -24,6 +26,15 @@ def download_one(row):
 def main():
     if not os.path.exists('images'):
         os.makedirs('images')
+
+    print("Downloading dataset.csv from HuggingFace...")
+    local_path = hf_hub_download(
+        repo_id="fast-stager/property-labels",
+        filename="dataset.csv",
+        repo_type="dataset"
+    )
+    shutil.copy(local_path, "dataset.csv")
+    print("Downloaded dataset.csv")
 
     df = pd.read_csv('dataset.csv')
     print(f"dataset.csv: {len(df)} rows, {df['group_id'].nunique()} groups")
