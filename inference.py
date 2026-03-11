@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from torchvision import transforms
 import numpy as np
 from model import MobileCLIPRanker, OrdinalRanker, LDLRanker, get_norm_stats
+from train_binary import BinaryClassifier
 
 def load_config(path="config.yml"):
     with open(path, 'r') as f:
@@ -47,6 +48,9 @@ class PropertyRanker:
         # Auto-detect model type from checkpoint keys
         self.is_ordinal = any('head.biases' in k for k in new_state_dict)
         self.is_ldl = any('score_values' in k for k in new_state_dict)
+        self.is_binary = any(k.startswith('head.') for k in new_state_dict) and \
+                         not any('head.attn' in k or 'head.norm1' in k for k in new_state_dict) and \
+                         not self.is_ordinal and not self.is_ldl
 
         if self.is_ldl:
             print("Detected LDL model")
@@ -54,6 +58,9 @@ class PropertyRanker:
         elif self.is_ordinal:
             print("Detected ordinal (CORAL) model")
             self.model = OrdinalRanker(self.cfg)
+        elif self.is_binary:
+            print("Detected binary classifier model")
+            self.model = BinaryClassifier(self.cfg)
         else:
             self.model = MobileCLIPRanker(self.cfg)
 
@@ -100,7 +107,11 @@ class PropertyRanker:
             return []
 
         with torch.no_grad():
-            if self.is_ldl or self.is_ordinal:
+            if self.is_binary:
+                # Pointwise binary: logit = P(selected)
+                batch = torch.stack(valid_tensors).to(self.device)
+                raw_scores = self.model(batch).cpu().numpy()
+            elif self.is_ldl or self.is_ordinal:
                 # Pointwise: score each image independently
                 batch = torch.stack(valid_tensors).to(self.device)  # (N, C, H, W)
                 raw_scores = self.model.score(batch).cpu().numpy()
