@@ -13,6 +13,8 @@ from tqdm import tqdm
 from model import _build_backbone, _find_unfrozen_modules, get_norm_stats
 from utils import load_config
 
+BINARY_CSV = "best_image_training_data.csv"
+
 
 class BinaryImageDataset(Dataset):
     """Pointwise binary dataset: each sample is one image with label 0 or 1."""
@@ -25,8 +27,8 @@ class BinaryImageDataset(Dataset):
             self.df['file_path'] = self.df.index.map(lambda x: os.path.join(images_dir, f"{x}.jpg"))
         self.df = self.df[self.df['file_path'].apply(os.path.exists)].reset_index(drop=True)
 
-        # Binary label: score > 0 -> selected (1), score <= 0 -> not selected (0)
-        self.df['label'] = (self.df['score'] > 0).astype(int)
+        # Use 'selected' column directly as label
+        self.df['label'] = self.df['selected'].astype(int)
 
         mean, std = norm_stats or ((0.481, 0.457, 0.408), (0.268, 0.261, 0.275))
 
@@ -122,12 +124,15 @@ def validate(model, val_loader, device):
 
 
 def validate_group_ranking(model, df_val, cfg, device, norm_stats=None):
-    """Gold accuracy: within each group, does the model's top-1 have score > 0?"""
+    """Gold accuracy: within each group, does the model's top-1 have selected=1?"""
     model.eval()
-    ds = BinaryImageDataset(
-        pd.DataFrame({'group_id': [], 'score': []}),
-        is_train=False, img_size=cfg.data.img_size, norm_stats=norm_stats,
-    )
+    mean, std = norm_stats or ((0.481, 0.457, 0.408), (0.268, 0.261, 0.275))
+    val_transform = transforms.Compose([
+        transforms.Resize(cfg.data.img_size, interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.CenterCrop(cfg.data.img_size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std),
+    ])
 
     if 'file_path' not in df_val.columns:
         df_val = df_val.copy()
@@ -140,8 +145,7 @@ def validate_group_ranking(model, df_val, cfg, device, norm_stats=None):
         for _, group in df_val.groupby('group_id'):
             if len(group) < 2:
                 continue
-            has_positive = (group['score'] > 0).any()
-            if not has_positive:
+            if not (group['selected'] == 1).any():
                 continue
 
             images = []
@@ -151,8 +155,8 @@ def validate_group_ranking(model, df_val, cfg, device, norm_stats=None):
                     continue
                 try:
                     with Image.open(row['file_path']) as img:
-                        images.append(ds.transform(img.convert('RGB')))
-                    gt_labels.append(1 if row['score'] > 0 else 0)
+                        images.append(val_transform(img.convert('RGB')))
+                    gt_labels.append(int(row['selected']))
                 except Exception:
                     continue
 
@@ -187,30 +191,27 @@ def main():
     accum_steps = getattr(cfg.train, 'gradient_accumulation_steps', 4)
     warmup_epochs = getattr(cfg.train, 'warmup_epochs', 0)
 
-    df = pd.read_csv(cfg.data.csv_path)
-    if 'file_path' not in df.columns:
-        df['file_path'] = df.index.map(lambda x: os.path.join('images', f"{x}.jpg"))
+    # Read best_image_training_data.csv directly
+    df = pd.read_csv(BINARY_CSV)
 
-    # Filter to binary groups only (scores are 0 and 10 only)
-    group_scores = df.groupby('group_id')['score'].apply(lambda x: set(x.unique()))
-    binary_groups = set(gid for gid, scores in group_scores.items() if scores <= {0.0, 10.0})
-    df_binary = df[df['group_id'].isin(binary_groups)].copy()
+    # Normalize columns: property_id -> group_id, image_url -> url
+    df = df.rename(columns={'property_id': 'group_id', 'image_url': 'url'})
+    df['file_path'] = df.index.map(lambda x: os.path.join('images', f"{x}.jpg"))
 
-    n_pos = (df_binary['score'] > 0).sum()
-    n_neg = (df_binary['score'] <= 0).sum()
-    print(f"Binary data: {len(df_binary)} images ({n_pos} selected, {n_neg} not selected) "
-          f"from {len(binary_groups)} groups")
+    n_pos = (df['selected'] == 1).sum()
+    n_neg = (df['selected'] == 0).sum()
+    print(f"Binary data: {len(df)} images ({n_pos} selected, {n_neg} not selected) "
+          f"from {df['group_id'].nunique()} groups")
 
     # Train/val split by group
     rng = np.random.RandomState(seed)
-    all_groups = list(binary_groups)
+    all_groups = df['group_id'].unique().tolist()
     rng.shuffle(all_groups)
     val_size = int(len(all_groups) * 0.1)
     val_groups = set(all_groups[:val_size])
-    train_groups = set(all_groups[val_size:])
 
-    train_df = df_binary[df_binary['group_id'].isin(train_groups)].copy()
-    val_df = df_binary[df_binary['group_id'].isin(val_groups)].copy()
+    train_df = df[~df['group_id'].isin(val_groups)].copy()
+    val_df = df[df['group_id'].isin(val_groups)].copy()
 
     norm_stats = get_norm_stats(cfg.model.name)
     train_ds = BinaryImageDataset(train_df, is_train=True, img_size=cfg.data.img_size, norm_stats=norm_stats)

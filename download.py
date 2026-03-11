@@ -6,6 +6,7 @@ def download_dataset():
     repo_id = "fast-stager/property-labels"
     files = {
         "dataset.csv": "dataset.csv",
+        "best_image_training_data.csv": "best_image_training_data.csv",
     }
 
     for filename, destination in files.items():
