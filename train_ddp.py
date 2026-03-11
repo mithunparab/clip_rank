@@ -305,24 +305,6 @@ def main():
     train_df = df[~df['group_id'].isin(val_groups)].copy()
     val_df = df[df['group_id'].isin(val_groups)].copy()
 
-    # Oversample gold-containing groups 3x — gold groups are ~14% of data;
-    # more frequent gold-vs-non-gold gradient is the key to gold accuracy.
-    gold_gids = (
-        train_df.groupby('group_id')['score']
-        .max()
-        .pipe(lambda s: set(s[s >= 7].index))
-    )
-    if gold_gids:
-        gold_rows = train_df[train_df['group_id'].isin(gold_gids)]
-        copies = []
-        for i in range(2):  # 2 extra copies = 3x total
-            dup = gold_rows.copy()
-            dup['group_id'] = dup['group_id'].apply(lambda x: f"{x}__aug{i}")
-            copies.append(dup)
-        train_df = pd.concat([train_df] + copies, ignore_index=True)
-        if rank == 0:
-            print(f"Oversampled {len(gold_gids)} gold groups 3x → {train_df['group_id'].nunique()} total groups")
-
     if use_cached:
         if not os.path.isdir(cache_dir):
             print(f"ERROR: Cache dir '{cache_dir}' not found. Run precompute_features.py first.")
