@@ -193,7 +193,7 @@ class CachedBinaryDataset(Dataset):
 
     def __getitem__(self, idx):
         path, label = self.items[idx]
-        feat = torch.load(path, weights_only=True)
+        feat = torch.load(path, weights_only=True).float()
         return feat, torch.tensor(label, dtype=torch.float32)
 
 
@@ -249,7 +249,7 @@ def validate_group_ranking_cached(model, df_val, cache_dir, device):
                 cache_path = os.path.join(cache_dir, fname)
                 if not os.path.exists(cache_path):
                     continue
-                feats.append(torch.load(cache_path, weights_only=True))
+                feats.append(torch.load(cache_path, weights_only=True).float())
                 gt_labels.append(int(row['selected']))
 
             if len(feats) < 2:
