@@ -105,7 +105,7 @@ def precompute_features(df, cfg, device, cache_dir):
     norm_stats = get_norm_stats(cfg.model.name)
     extract_paths = [paths[i] for i in indices_to_extract]
     ds = ImageOnlyDataset(extract_paths, img_size=cfg.data.img_size, norm_stats=norm_stats)
-    loader = DataLoader(ds, batch_size=64, num_workers=cfg.system.num_workers,
+    loader = DataLoader(ds, batch_size=32, num_workers=cfg.system.num_workers,
                         pin_memory=True, shuffle=False)
 
     backbone, _ = _build_backbone(cfg)
