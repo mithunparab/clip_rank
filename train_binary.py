@@ -84,8 +84,24 @@ class ImageOnlyDataset(Dataset):
             return torch.zeros(3, 224, 224), idx
 
 
+def _extract_on_device(backbone, loader, extract_paths, cache_dir, gpu_id):
+    """Run feature extraction on a single GPU."""
+    device = torch.device(f"cuda:{gpu_id}")
+    backbone = backbone.to(device)
+    count = 0
+    with torch.no_grad(), torch.amp.autocast("cuda"):
+        for batch, batch_indices in loader:
+            batch = batch.to(device)
+            feats = backbone(batch).cpu()
+            for j, feat in zip(batch_indices, feats):
+                fname = os.path.basename(extract_paths[j.item()]).replace('.jpg', '.pt')
+                torch.save(feat, os.path.join(cache_dir, fname))
+                count += 1
+    return count
+
+
 def precompute_features(df, cfg, device, cache_dir):
-    """Extract backbone features for all images and save to disk."""
+    """Extract backbone features using all available GPUs in parallel."""
     os.makedirs(cache_dir, exist_ok=True)
 
     # Check which images still need extraction
@@ -100,29 +116,59 @@ def precompute_features(df, cfg, device, cache_dir):
         print(f"All {len(paths)} features already cached in {cache_dir}/")
         return
 
-    print(f"Extracting features for {len(indices_to_extract)}/{len(paths)} images...")
-
     norm_stats = get_norm_stats(cfg.model.name)
     extract_paths = [paths[i] for i in indices_to_extract]
-    ds = ImageOnlyDataset(extract_paths, img_size=cfg.data.img_size, norm_stats=norm_stats)
-    loader = DataLoader(ds, batch_size=32, num_workers=cfg.system.num_workers,
-                        pin_memory=True, shuffle=False)
+    n_gpus = torch.cuda.device_count()
 
-    backbone, _ = _build_backbone(cfg)
-    backbone.eval()
-    for p in backbone.parameters():
-        p.requires_grad = False
-    backbone.to(device)
+    print(f"Extracting features for {len(indices_to_extract)}/{len(paths)} images on {n_gpus} GPU(s)...")
 
-    with torch.no_grad(), torch.amp.autocast("cuda"):
-        for batch, batch_indices in tqdm(loader, desc="Extracting features"):
-            batch = batch.to(device)
-            feats = backbone(batch).cpu()
-            for j, feat in zip(batch_indices, feats):
-                fname = os.path.basename(extract_paths[j.item()]).replace('.jpg', '.pt')
-                torch.save(feat, os.path.join(cache_dir, fname))
+    if n_gpus <= 1:
+        # Single GPU path
+        ds = ImageOnlyDataset(extract_paths, img_size=cfg.data.img_size, norm_stats=norm_stats)
+        loader = DataLoader(ds, batch_size=32, num_workers=cfg.system.num_workers,
+                            pin_memory=True, shuffle=False)
+        backbone, _ = _build_backbone(cfg)
+        backbone.eval()
+        for p in backbone.parameters():
+            p.requires_grad = False
+        _extract_on_device(backbone, tqdm(loader, desc="Extracting"), extract_paths, cache_dir, 0)
+        del backbone
+    else:
+        # Multi-GPU: split images across GPUs, run in parallel threads
+        import threading
+        chunk_size = (len(extract_paths) + n_gpus - 1) // n_gpus
+        threads = []
+        progress_bars = []
 
-    del backbone
+        for gpu_id in range(n_gpus):
+            start = gpu_id * chunk_size
+            end = min(start + chunk_size, len(extract_paths))
+            if start >= len(extract_paths):
+                break
+            gpu_paths = extract_paths[start:end]
+            # Remap indices: ImageOnlyDataset uses local indices, but we need global indices for naming
+            ds = ImageOnlyDataset(gpu_paths, img_size=cfg.data.img_size, norm_stats=norm_stats)
+            loader = DataLoader(ds, batch_size=32, num_workers=2, pin_memory=True, shuffle=False)
+
+            # Build a separate backbone copy per GPU
+            backbone, _ = _build_backbone(cfg)
+            backbone.eval()
+            for p in backbone.parameters():
+                p.requires_grad = False
+
+            pbar = tqdm(loader, desc=f"GPU {gpu_id}", position=gpu_id)
+            t = threading.Thread(target=_extract_on_device,
+                                 args=(backbone, pbar, gpu_paths, cache_dir, gpu_id))
+            threads.append(t)
+            progress_bars.append(pbar)
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        for pb in progress_bars:
+            pb.close()
+
     torch.cuda.empty_cache()
     print(f"Cached {len(indices_to_extract)} features to {cache_dir}/")
 
