@@ -33,3 +33,9 @@ train:
   gradient_accumulation_steps: 32
   # Ordinal (CORAL) training
   gold_weight: 3.0       # extra weight on gold-tier thresholds (7, 8, 9)
+
+# Binary classification overrides (train_binary.py)
+binary:
+  lr_head: 0.001
+  lr_backbone: 0.00001
+  gradient_accumulation_steps: 4

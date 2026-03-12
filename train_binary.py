@@ -223,7 +223,13 @@ def main():
 
     os.makedirs(cfg.train.save_dir, exist_ok=True)
 
-    accum_steps = getattr(cfg.train, 'gradient_accumulation_steps', 4)
+    # Binary overrides: cfg.binary.X falls back to cfg.train.X
+    def bcfg(key, default=None):
+        return getattr(getattr(cfg, 'binary', None), key, None) or getattr(cfg.train, key, default)
+
+    lr_head = bcfg('lr_head', 1e-3)
+    lr_backbone = bcfg('lr_backbone', 1e-5)
+    accum_steps = bcfg('gradient_accumulation_steps', 4)
     warmup_epochs = getattr(cfg.train, 'warmup_epochs', 0)
 
     # Read best_image_training_data.csv directly
@@ -295,8 +301,8 @@ def main():
             backbone_params.append(param)
 
     optimizer = optim.AdamW([
-        {'params': backbone_params, 'lr': cfg.train.lr_backbone},
-        {'params': head_params, 'lr': cfg.train.lr_head},
+        {'params': backbone_params, 'lr': lr_backbone},
+        {'params': head_params, 'lr': lr_head},
     ], weight_decay=cfg.train.weight_decay)
 
     warmup_sched = optim.lr_scheduler.LinearLR(
@@ -324,7 +330,8 @@ def main():
         print(f"Binary data: {len(df)} images ({n_pos} selected, {n_neg} not selected) "
               f"from {df['group_id'].nunique()} groups")
         print(f"Training binary classifier | {len(train_ds)} train, {len(val_ds)} val | "
-              f"pos_weight={pos_weight.item():.2f} | AMP={use_amp}")
+              f"pos_weight={pos_weight.item():.2f} | lr_head={lr_head:.1e} lr_bb={lr_backbone:.1e} "
+              f"accum={accum_steps} | AMP={use_amp}")
 
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=True)
