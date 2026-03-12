@@ -37,5 +37,5 @@ train:
 # Binary classification overrides (train_binary.py)
 binary:
   lr_head: 0.001
-  lr_backbone: 0.00001
+  lr_backbone: 0.0            # freeze backbone, only train head
   gradient_accumulation_steps: 4

@@ -288,7 +288,7 @@ def main():
     if dist.is_initialized():
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
-    # Differential LR
+    # Differential LR (lr_backbone=0 means fully frozen)
     raw_model = model.module if hasattr(model, "module") else model
     backbone_params = []
     head_params = []
@@ -298,12 +298,16 @@ def main():
         if "head" in name:
             head_params.append(param)
         else:
-            backbone_params.append(param)
+            if lr_backbone == 0:
+                param.requires_grad = False
+            else:
+                backbone_params.append(param)
 
-    optimizer = optim.AdamW([
-        {'params': backbone_params, 'lr': lr_backbone},
-        {'params': head_params, 'lr': lr_head},
-    ], weight_decay=cfg.train.weight_decay)
+    param_groups = [{'params': head_params, 'lr': lr_head}]
+    if backbone_params:
+        param_groups.append({'params': backbone_params, 'lr': lr_backbone})
+
+    optimizer = optim.AdamW(param_groups, weight_decay=cfg.train.weight_decay)
 
     warmup_sched = optim.lr_scheduler.LinearLR(
         optimizer, start_factor=1.0 / max(warmup_epochs, 1), total_iters=max(warmup_epochs, 1)
