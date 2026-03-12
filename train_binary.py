@@ -1,13 +1,18 @@
+"""Binary classification trainer for best-image selection.
+
+Phase 1: Precompute backbone features (once, cached to disk).
+Phase 2: Train a lightweight MLP head on cached features (~seconds/epoch).
+
+Usage:
+    python train_binary.py                  # runs both phases
+    python train_binary.py --skip-cache     # skip phase 1 if already cached
+"""
 import os
 import argparse
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
-from torch.utils.data.distributed import DistributedSampler
-from torch.nn.parallel import DistributedDataParallel as DDP
-import torch.distributed as dist
 import pandas as pd
 import numpy as np
 from PIL import Image
@@ -17,68 +22,6 @@ from model import _build_backbone, _find_unfrozen_modules, get_norm_stats
 from utils import load_config
 
 BINARY_CSV = "best_image_training_data.csv"
-
-
-def setup_ddp():
-    if "RANK" in os.environ:
-        dist.init_process_group(backend="nccl")
-        rank = int(os.environ["RANK"])
-        local_rank = int(os.environ["LOCAL_RANK"])
-        torch.cuda.set_device(local_rank)
-        return rank, local_rank
-    return 0, 0
-
-
-def cleanup_ddp():
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
-class BinaryImageDataset(Dataset):
-    """Pointwise binary dataset: each sample is one image with label 0 or 1."""
-
-    def __init__(self, df, images_dir="images", is_train=False, img_size=224, norm_stats=None):
-        self.img_size = img_size
-        self.df = df.copy()
-
-        if 'file_path' not in self.df.columns:
-            self.df['file_path'] = self.df.index.map(lambda x: os.path.join(images_dir, f"{x}.jpg"))
-        self.df = self.df[self.df['file_path'].apply(os.path.exists)].reset_index(drop=True)
-
-        # Use 'selected' column directly as label
-        self.df['label'] = self.df['selected'].astype(int)
-
-        mean, std = norm_stats or ((0.481, 0.457, 0.408), (0.268, 0.261, 0.275))
-
-        if is_train:
-            self.transform = transforms.Compose([
-                transforms.RandomResizedCrop(img_size, scale=(0.8, 1.0),
-                                             interpolation=transforms.InterpolationMode.BICUBIC),
-                transforms.RandomHorizontalFlip(),
-                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=mean, std=std),
-            ])
-        else:
-            self.transform = transforms.Compose([
-                transforms.Resize(img_size, interpolation=transforms.InterpolationMode.BICUBIC),
-                transforms.CenterCrop(img_size),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=mean, std=std),
-            ])
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        try:
-            with Image.open(row['file_path']) as img:
-                tensor = self.transform(img.convert('RGB'))
-        except Exception:
-            tensor = torch.zeros(3, self.img_size, self.img_size)
-
-        return tensor, torch.tensor(row['label'], dtype=torch.float32)
 
 
 class BinaryClassifier(nn.Module):
@@ -115,132 +58,178 @@ class BinaryClassifier(nn.Module):
         return self.head(features).squeeze(-1)
 
 
-def validate(model, val_loader, device):
-    model.eval()
-    correct = 0
-    total = 0
-    tp = fp = fn = tn = 0
+# ── Phase 1: Precompute features ──────────────────────────────────────
 
+class ImageOnlyDataset(Dataset):
+    """Returns (image_tensor, index) for feature extraction."""
+
+    def __init__(self, file_paths, img_size=224, norm_stats=None):
+        self.paths = file_paths
+        mean, std = norm_stats or ((0.481, 0.457, 0.408), (0.268, 0.261, 0.275))
+        self.transform = transforms.Compose([
+            transforms.Resize(img_size, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.CenterCrop(img_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+        ])
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        try:
+            with Image.open(self.paths[idx]) as img:
+                return self.transform(img.convert('RGB')), idx
+        except Exception:
+            return torch.zeros(3, 224, 224), idx
+
+
+def precompute_features(df, cfg, device, cache_dir):
+    """Extract backbone features for all images and save to disk."""
+    os.makedirs(cache_dir, exist_ok=True)
+
+    # Check which images still need extraction
+    paths = df['file_path'].tolist()
+    indices_to_extract = []
+    for i, p in enumerate(paths):
+        cache_path = os.path.join(cache_dir, f"{os.path.basename(p).replace('.jpg', '.pt')}")
+        if not os.path.exists(cache_path) and os.path.exists(p):
+            indices_to_extract.append(i)
+
+    if not indices_to_extract:
+        print(f"All {len(paths)} features already cached in {cache_dir}/")
+        return
+
+    print(f"Extracting features for {len(indices_to_extract)}/{len(paths)} images...")
+
+    norm_stats = get_norm_stats(cfg.model.name)
+    extract_paths = [paths[i] for i in indices_to_extract]
+    ds = ImageOnlyDataset(extract_paths, img_size=cfg.data.img_size, norm_stats=norm_stats)
+    loader = DataLoader(ds, batch_size=64, num_workers=cfg.system.num_workers,
+                        pin_memory=True, shuffle=False)
+
+    backbone, _ = _build_backbone(cfg)
+    backbone.eval()
+    for p in backbone.parameters():
+        p.requires_grad = False
+    backbone.to(device)
+
+    with torch.no_grad(), torch.amp.autocast("cuda"):
+        for batch, batch_indices in tqdm(loader, desc="Extracting features"):
+            batch = batch.to(device)
+            feats = backbone(batch).cpu()
+            for j, feat in zip(batch_indices, feats):
+                fname = os.path.basename(extract_paths[j.item()]).replace('.jpg', '.pt')
+                torch.save(feat, os.path.join(cache_dir, fname))
+
+    del backbone
+    torch.cuda.empty_cache()
+    print(f"Cached {len(indices_to_extract)} features to {cache_dir}/")
+
+
+# ── Phase 2: Train head on cached features ────────────────────────────
+
+class CachedBinaryDataset(Dataset):
+    """Loads precomputed features + binary labels."""
+
+    def __init__(self, df, cache_dir):
+        self.cache_dir = cache_dir
+        self.items = []
+        for _, row in df.iterrows():
+            fname = os.path.basename(row['file_path']).replace('.jpg', '.pt')
+            cache_path = os.path.join(cache_dir, fname)
+            if os.path.exists(cache_path):
+                self.items.append((cache_path, int(row['selected'])))
+        self.labels = np.array([item[1] for item in self.items])
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, idx):
+        path, label = self.items[idx]
+        feat = torch.load(path, weights_only=True)
+        return feat, torch.tensor(label, dtype=torch.float32)
+
+
+class HeadOnly(nn.Module):
+    """Standalone MLP head for training on cached features."""
+
+    def __init__(self, in_dim, hidden_dim=256, dropout=0.1):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, x):
+        return self.head(x).squeeze(-1)
+
+
+def validate_cached(model, val_loader, device):
+    model.eval()
+    correct = total = tp = fp = fn = tn = 0
     with torch.no_grad():
-        for images, labels in val_loader:
-            images, labels = images.to(device), labels.to(device)
-            logits = model(images)
-            preds = (logits > 0).float()
+        for feats, labels in val_loader:
+            feats, labels = feats.to(device), labels.to(device)
+            preds = (model(feats) > 0).float()
             correct += (preds == labels).sum().item()
             total += labels.size(0)
-
             tp += ((preds == 1) & (labels == 1)).sum().item()
             fp += ((preds == 1) & (labels == 0)).sum().item()
             fn += ((preds == 0) & (labels == 1)).sum().item()
             tn += ((preds == 0) & (labels == 0)).sum().item()
+    acc = correct / total if total else 0
+    prec = tp / (tp + fp) if (tp + fp) else 0
+    rec = tp / (tp + fn) if (tp + fn) else 0
+    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0
+    return acc, prec, rec, f1
 
-    acc = correct / total if total > 0 else 0
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-    return acc, precision, recall, f1
 
-
-def validate_group_ranking(model, df_val, cfg, device, norm_stats=None):
-    """Gold accuracy: within each group, does the model's top-1 have selected=1?"""
-    raw_model = model.module if hasattr(model, 'module') else model
-    raw_model.eval()
-    mean, std = norm_stats or ((0.481, 0.457, 0.408), (0.268, 0.261, 0.275))
-    val_transform = transforms.Compose([
-        transforms.Resize(cfg.data.img_size, interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.CenterCrop(cfg.data.img_size),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=mean, std=std),
-    ])
-
-    if 'file_path' not in df_val.columns:
-        df_val = df_val.copy()
-        df_val['file_path'] = df_val.index.map(lambda x: f"images/{x}.jpg")
-
-    top1_hits = 0
-    total = 0
-
+def validate_group_ranking_cached(model, df_val, cache_dir, device):
+    """Gold accuracy on cached features: does the top-1 prediction pick selected=1?"""
+    model.eval()
+    top1_hits = total = 0
     with torch.no_grad():
         for _, group in df_val.groupby('group_id'):
-            if len(group) < 2:
-                continue
-            if not (group['selected'] == 1).any():
+            if len(group) < 2 or not (group['selected'] == 1).any():
                 continue
 
-            images = []
-            gt_labels = []
+            feats, gt_labels = [], []
             for _, row in group.iterrows():
-                if not os.path.exists(row['file_path']):
+                fname = os.path.basename(row['file_path']).replace('.jpg', '.pt')
+                cache_path = os.path.join(cache_dir, fname)
+                if not os.path.exists(cache_path):
                     continue
-                try:
-                    with Image.open(row['file_path']) as img:
-                        images.append(val_transform(img.convert('RGB')))
-                    gt_labels.append(int(row['selected']))
-                except Exception:
-                    continue
+                feats.append(torch.load(cache_path, weights_only=True))
+                gt_labels.append(int(row['selected']))
 
-            if len(images) < 2:
+            if len(feats) < 2:
                 continue
 
-            batch = torch.stack(images).to(device)
-            logits = raw_model(batch)
-            top1_idx = logits.argmax().item()
-            top1_hits += gt_labels[top1_idx]
+            batch = torch.stack(feats).to(device)
+            logits = model(batch)
+            top1_hits += gt_labels[logits.argmax().item()]
             total += 1
 
-    return top1_hits / total if total > 0 else 0.0
+    return top1_hits / total if total else 0.0
 
 
-def save_checkpoint(model, optimizer, epoch, path, is_best=False):
-    raw_model = model.module if hasattr(model, "module") else model
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': raw_model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-    }
-    torch.save(checkpoint, path)
-    if is_best:
-        best_path = os.path.join(os.path.dirname(path), "best_model.pth")
-        torch.save(checkpoint, best_path)
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--resume', type=str, default=None)
-    args = parser.parse_args()
-
-    rank, local_rank = setup_ddp()
-    cfg = load_config("config.yml")
-
+def train_head(df, cfg, device, cache_dir):
+    """Train the MLP head on precomputed features."""
     import random
     seed = getattr(cfg.train, 'seed', 42)
     random.seed(seed)
     torch.manual_seed(seed)
     np.random.seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
-    os.makedirs(cfg.train.save_dir, exist_ok=True)
-
-    # Binary overrides: cfg.binary.X falls back to cfg.train.X
     def bcfg(key, default=None):
         return getattr(getattr(cfg, 'binary', None), key, None) or getattr(cfg.train, key, default)
 
     lr_head = bcfg('lr_head', 1e-3)
-    lr_backbone = bcfg('lr_backbone', 1e-5)
     accum_steps = bcfg('gradient_accumulation_steps', 4)
-    warmup_epochs = getattr(cfg.train, 'warmup_epochs', 0)
-
-    # Read best_image_training_data.csv directly
-    df = pd.read_csv(BINARY_CSV)
-
-    # Normalize columns: property_id -> group_id, image_url -> url
-    df = df.rename(columns={'property_id': 'group_id', 'image_url': 'url'})
-    df['file_path'] = df.index.map(lambda x: os.path.join('images', f"{x}.jpg"))
-
-    n_pos = (df['selected'] == 1).sum()
-    n_neg = (df['selected'] == 0).sum()
 
     # Train/val split by group
     rng = np.random.RandomState(seed)
@@ -249,166 +238,121 @@ def main():
     val_size = int(len(all_groups) * 0.1)
     val_groups = set(all_groups[:val_size])
 
-    train_df = df[~df['group_id'].isin(val_groups)].copy()
-    val_df = df[df['group_id'].isin(val_groups)].copy()
+    train_df = df[~df['group_id'].isin(val_groups)]
+    val_df = df[df['group_id'].isin(val_groups)]
 
-    norm_stats = get_norm_stats(cfg.model.name)
-    train_ds = BinaryImageDataset(train_df, is_train=True, img_size=cfg.data.img_size, norm_stats=norm_stats)
-    val_ds = BinaryImageDataset(val_df, is_train=False, img_size=cfg.data.img_size, norm_stats=norm_stats)
+    train_ds = CachedBinaryDataset(train_df, cache_dir)
+    val_ds = CachedBinaryDataset(val_df, cache_dir)
 
-    # DDP: DistributedSampler, else WeightedRandomSampler for class balance
-    if dist.is_initialized():
-        sampler = DistributedSampler(train_ds, shuffle=True, seed=seed)
-    else:
-        labels = train_ds.df['label'].values
-        class_counts = np.bincount(labels)
-        weights = 1.0 / class_counts[labels]
-        sampler = WeightedRandomSampler(weights, len(weights), replacement=True)
+    n_pos = train_ds.labels.sum()
+    n_neg = len(train_ds.labels) - n_pos
 
-    def worker_init_fn(worker_id):
-        np.random.seed(seed + worker_id)
+    # Weighted sampler for class balance
+    class_counts = np.bincount(train_ds.labels)
+    weights = 1.0 / class_counts[train_ds.labels]
+    sampler = WeightedRandomSampler(weights, len(weights), replacement=True)
 
-    train_loader = DataLoader(
-        train_ds, batch_size=cfg.train.batch_size * 8,
-        sampler=sampler,
-        num_workers=cfg.system.num_workers,
-        pin_memory=cfg.system.pin_memory,
-        worker_init_fn=worker_init_fn,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=cfg.train.batch_size * 8,
-        shuffle=False,
-        num_workers=cfg.system.num_workers,
-        pin_memory=cfg.system.pin_memory,
-    )
+    train_loader = DataLoader(train_ds, batch_size=512, sampler=sampler, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=512, shuffle=False, num_workers=4, pin_memory=True)
 
-    device = torch.device(f"cuda:{local_rank}")
-    model = BinaryClassifier(cfg).to(device)
+    # Detect feature dim
+    sample_feat, _ = train_ds[0]
+    feat_dim = sample_feat.shape[-1]
 
-    if dist.is_initialized():
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+    hidden = getattr(cfg.model, 'head_hidden_dim', 256)
+    dropout = getattr(cfg.model, 'head_dropout', 0.1)
+    model = HeadOnly(feat_dim, hidden, dropout).to(device)
 
-    # Differential LR (lr_backbone=0 means fully frozen)
-    raw_model = model.module if hasattr(model, "module") else model
-    backbone_params = []
-    head_params = []
-    for name, param in raw_model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if "head" in name:
-            head_params.append(param)
-        else:
-            if lr_backbone == 0:
-                param.requires_grad = False
-            else:
-                backbone_params.append(param)
+    optimizer = optim.AdamW(model.parameters(), lr=lr_head, weight_decay=cfg.train.weight_decay)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.train.epochs, eta_min=1e-6)
 
-    param_groups = [{'params': head_params, 'lr': lr_head}]
-    if backbone_params:
-        param_groups.append({'params': backbone_params, 'lr': lr_backbone})
-
-    optimizer = optim.AdamW(param_groups, weight_decay=cfg.train.weight_decay)
-
-    warmup_sched = optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=1.0 / max(warmup_epochs, 1), total_iters=max(warmup_epochs, 1)
-    )
-    cosine_sched = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(cfg.train.epochs - warmup_epochs, 1), eta_min=1e-7
-    )
-    scheduler = optim.lr_scheduler.SequentialLR(
-        optimizer, [warmup_sched, cosine_sched], milestones=[max(warmup_epochs, 1)]
-    )
-
-    # BCE with pos_weight to handle class imbalance
     pos_weight = torch.tensor([n_neg / n_pos]).to(device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    use_amp = device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda") if use_amp else None
-
-    best_metric = 0.0
     patience = getattr(cfg.train, 'patience', 20)
     patience_counter = 0
+    best_metric = 0.0
 
-    if rank == 0:
-        print(f"Binary data: {len(df)} images ({n_pos} selected, {n_neg} not selected) "
-              f"from {df['group_id'].nunique()} groups")
-        print(f"Training binary classifier | {len(train_ds)} train, {len(val_ds)} val | "
-              f"pos_weight={pos_weight.item():.2f} | lr_head={lr_head:.1e} lr_bb={lr_backbone:.1e} "
-              f"accum={accum_steps} | AMP={use_amp}")
+    print(f"Training head | {len(train_ds)} train, {len(val_ds)} val | "
+          f"feat_dim={feat_dim} | lr={lr_head:.1e} | pos_weight={pos_weight.item():.2f}")
 
-    if args.resume:
-        ckpt = torch.load(args.resume, map_location=device, weights_only=True)
-        raw_model = model.module if hasattr(model, "module") else model
-        raw_model.load_state_dict(ckpt['model_state_dict'])
-        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        if rank == 0:
-            print(f"Resumed from {args.resume}")
+    os.makedirs(cfg.train.save_dir, exist_ok=True)
 
     for epoch in range(cfg.train.epochs):
         model.train()
         total_loss = 0.0
-
-        if hasattr(sampler, 'set_epoch'):
-            sampler.set_epoch(epoch)
-
         optimizer.zero_grad(set_to_none=True)
-        iterator = tqdm(train_loader, desc=f"Epoch {epoch+1}") if rank == 0 else train_loader
 
-        for step, (images, labels) in enumerate(iterator):
-            images, labels = images.to(device), labels.to(device)
+        for step, (feats, labels) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}", leave=False)):
+            feats, labels = feats.to(device), labels.to(device)
+            logits = model(feats)
+            loss = criterion(logits, labels) / accum_steps
+            loss.backward()
 
-            if use_amp:
-                with torch.amp.autocast("cuda"):
-                    logits = model(images)
-                    loss = criterion(logits, labels) / accum_steps
-
-                scaler.scale(loss).backward()
-
-                if (step + 1) % accum_steps == 0 or (step + 1) == len(train_loader):
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad(set_to_none=True)
-            else:
-                logits = model(images)
-                loss = criterion(logits, labels) / accum_steps
-                loss.backward()
-
-                if (step + 1) % accum_steps == 0 or (step + 1) == len(train_loader):
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
-                    optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
+            if (step + 1) % accum_steps == 0 or (step + 1) == len(train_loader):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
             total_loss += loss.item() * accum_steps
 
         scheduler.step()
 
-        if rank == 0:
-            avg_loss = total_loss / len(train_loader)
-            raw_val = model.module if hasattr(model, 'module') else model
-            acc, prec, rec, f1 = validate(raw_val, val_loader, device)
-            gold_acc = validate_group_ranking(model, val_df, cfg, device, norm_stats=norm_stats)
-            lr = optimizer.param_groups[0]['lr']
+        avg_loss = total_loss / len(train_loader)
+        acc, prec, rec, f1 = validate_cached(model, val_loader, device)
+        gold_acc = validate_group_ranking_cached(model, val_df, cache_dir, device)
+        lr = optimizer.param_groups[0]['lr']
 
-            print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Acc: {acc:.2%} | "
-                  f"P: {prec:.2%} R: {rec:.2%} F1: {f1:.2%} | GoldAcc: {gold_acc:.2%} | LR: {lr:.2e}")
+        print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Acc: {acc:.2%} | "
+              f"P: {prec:.2%} R: {rec:.2%} F1: {f1:.2%} | GoldAcc: {gold_acc:.2%} | LR: {lr:.2e}")
 
-            if gold_acc > best_metric:
-                best_metric = gold_acc
-                patience_counter = 0
-                save_checkpoint(model, optimizer, epoch + 1, f"{cfg.train.save_dir}/last.pth", is_best=True)
-                print(f"  -> New best GoldAcc: {gold_acc:.2%}")
-            else:
-                patience_counter += 1
-                save_checkpoint(model, optimizer, epoch + 1, f"{cfg.train.save_dir}/last.pth", is_best=False)
+        if gold_acc > best_metric:
+            best_metric = gold_acc
+            patience_counter = 0
+            torch.save({'epoch': epoch + 1, 'model_state_dict': model.state_dict(),
+                        'feat_dim': feat_dim}, f"{cfg.train.save_dir}/best_binary_head.pth")
+            print(f"  -> New best GoldAcc: {gold_acc:.2%}")
+        else:
+            patience_counter += 1
 
-            if patience_counter >= patience:
-                print(f"Early stopping. Best GoldAcc: {best_metric:.2%}")
-                break
+        if patience_counter >= patience:
+            print(f"Early stopping. Best GoldAcc: {best_metric:.2%}")
+            break
 
-    cleanup_ddp()
+    # Save full model (backbone + head) for inference compatibility
+    print("Assembling full model for inference...")
+    full_model = BinaryClassifier(cfg)
+    head_ckpt = torch.load(f"{cfg.train.save_dir}/best_binary_head.pth", weights_only=True)
+    # Map HeadOnly state_dict to BinaryClassifier's head
+    full_model.head.load_state_dict({k.replace('head.', ''): v
+                                     for k, v in head_ckpt['model_state_dict'].items()})
+    torch.save({'epoch': head_ckpt['epoch'],
+                'model_state_dict': full_model.state_dict()},
+               f"{cfg.train.save_dir}/best_model.pth")
+    print(f"Saved full model to {cfg.train.save_dir}/best_model.pth")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--skip-cache', action='store_true', help='Skip feature extraction (use existing cache)')
+    args = parser.parse_args()
+
+    cfg = load_config("config.yml")
+    cache_dir = "cached_features_binary"
+    device = torch.device(cfg.system.device if torch.cuda.is_available() else "cpu")
+
+    df = pd.read_csv(BINARY_CSV)
+    df = df.rename(columns={'property_id': 'group_id', 'image_url': 'url'})
+    df['file_path'] = df.index.map(lambda x: os.path.join('images', f"{x}.jpg"))
+
+    print(f"Binary data: {len(df)} images, {df['group_id'].nunique()} groups")
+
+    # Phase 1: Extract features
+    if not args.skip_cache:
+        precompute_features(df, cfg, device, cache_dir)
+
+    # Phase 2: Train head
+    train_head(df, cfg, device, cache_dir)
 
 
 if __name__ == "__main__":
