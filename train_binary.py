@@ -5,6 +5,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 import pandas as pd
 import numpy as np
 from PIL import Image
@@ -14,6 +17,21 @@ from model import _build_backbone, _find_unfrozen_modules, get_norm_stats
 from utils import load_config
 
 BINARY_CSV = "best_image_training_data.csv"
+
+
+def setup_ddp():
+    if "RANK" in os.environ:
+        dist.init_process_group(backend="nccl")
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        return rank, local_rank
+    return 0, 0
+
+
+def cleanup_ddp():
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 class BinaryImageDataset(Dataset):
@@ -125,7 +143,8 @@ def validate(model, val_loader, device):
 
 def validate_group_ranking(model, df_val, cfg, device, norm_stats=None):
     """Gold accuracy: within each group, does the model's top-1 have selected=1?"""
-    model.eval()
+    raw_model = model.module if hasattr(model, 'module') else model
+    raw_model.eval()
     mean, std = norm_stats or ((0.481, 0.457, 0.408), (0.268, 0.261, 0.275))
     val_transform = transforms.Compose([
         transforms.Resize(cfg.data.img_size, interpolation=transforms.InterpolationMode.BICUBIC),
@@ -164,7 +183,7 @@ def validate_group_ranking(model, df_val, cfg, device, norm_stats=None):
                 continue
 
             batch = torch.stack(images).to(device)
-            logits = model(batch)
+            logits = raw_model(batch)
             top1_idx = logits.argmax().item()
             top1_hits += gt_labels[top1_idx]
             total += 1
@@ -172,11 +191,25 @@ def validate_group_ranking(model, df_val, cfg, device, norm_stats=None):
     return top1_hits / total if total > 0 else 0.0
 
 
+def save_checkpoint(model, optimizer, epoch, path, is_best=False):
+    raw_model = model.module if hasattr(model, "module") else model
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': raw_model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+    }
+    torch.save(checkpoint, path)
+    if is_best:
+        best_path = os.path.join(os.path.dirname(path), "best_model.pth")
+        torch.save(checkpoint, best_path)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--resume', type=str, default=None)
     args = parser.parse_args()
 
+    rank, local_rank = setup_ddp()
     cfg = load_config("config.yml")
 
     import random
@@ -185,6 +218,8 @@ def main():
     torch.manual_seed(seed)
     np.random.seed(seed)
     torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     os.makedirs(cfg.train.save_dir, exist_ok=True)
 
@@ -200,8 +235,6 @@ def main():
 
     n_pos = (df['selected'] == 1).sum()
     n_neg = (df['selected'] == 0).sum()
-    print(f"Binary data: {len(df)} images ({n_pos} selected, {n_neg} not selected) "
-          f"from {df['group_id'].nunique()} groups")
 
     # Train/val split by group
     rng = np.random.RandomState(seed)
@@ -217,17 +250,24 @@ def main():
     train_ds = BinaryImageDataset(train_df, is_train=True, img_size=cfg.data.img_size, norm_stats=norm_stats)
     val_ds = BinaryImageDataset(val_df, is_train=False, img_size=cfg.data.img_size, norm_stats=norm_stats)
 
-    # Weighted sampler to handle class imbalance
-    labels = train_ds.df['label'].values
-    class_counts = np.bincount(labels)
-    weights = 1.0 / class_counts[labels]
-    sampler = WeightedRandomSampler(weights, len(weights), replacement=True)
+    # DDP: DistributedSampler, else WeightedRandomSampler for class balance
+    if dist.is_initialized():
+        sampler = DistributedSampler(train_ds, shuffle=True, seed=seed)
+    else:
+        labels = train_ds.df['label'].values
+        class_counts = np.bincount(labels)
+        weights = 1.0 / class_counts[labels]
+        sampler = WeightedRandomSampler(weights, len(weights), replacement=True)
+
+    def worker_init_fn(worker_id):
+        np.random.seed(seed + worker_id)
 
     train_loader = DataLoader(
-        train_ds, batch_size=cfg.train.batch_size * 8,  # pointwise -> bigger batch
+        train_ds, batch_size=cfg.train.batch_size * 8,
         sampler=sampler,
         num_workers=cfg.system.num_workers,
         pin_memory=cfg.system.pin_memory,
+        worker_init_fn=worker_init_fn,
     )
     val_loader = DataLoader(
         val_ds, batch_size=cfg.train.batch_size * 8,
@@ -236,13 +276,17 @@ def main():
         pin_memory=cfg.system.pin_memory,
     )
 
-    device = torch.device(cfg.system.device if torch.cuda.is_available() else "cpu")
+    device = torch.device(f"cuda:{local_rank}")
     model = BinaryClassifier(cfg).to(device)
 
+    if dist.is_initialized():
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+
     # Differential LR
+    raw_model = model.module if hasattr(model, "module") else model
     backbone_params = []
     head_params = []
-    for name, param in model.named_parameters():
+    for name, param in raw_model.named_parameters():
         if not param.requires_grad:
             continue
         if "head" in name:
@@ -265,7 +309,7 @@ def main():
         optimizer, [warmup_sched, cosine_sched], milestones=[max(warmup_epochs, 1)]
     )
 
-    # BCE with pos_weight to handle remaining imbalance
+    # BCE with pos_weight to handle class imbalance
     pos_weight = torch.tensor([n_neg / n_pos]).to(device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
@@ -276,21 +320,29 @@ def main():
     patience = getattr(cfg.train, 'patience', 20)
     patience_counter = 0
 
-    print(f"Training binary classifier | {len(train_ds)} train, {len(val_ds)} val | "
-          f"pos_weight={pos_weight.item():.2f} | AMP={use_amp}")
+    if rank == 0:
+        print(f"Binary data: {len(df)} images ({n_pos} selected, {n_neg} not selected) "
+              f"from {df['group_id'].nunique()} groups")
+        print(f"Training binary classifier | {len(train_ds)} train, {len(val_ds)} val | "
+              f"pos_weight={pos_weight.item():.2f} | AMP={use_amp}")
 
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=True)
-        model.load_state_dict(ckpt['model_state_dict'])
+        raw_model = model.module if hasattr(model, "module") else model
+        raw_model.load_state_dict(ckpt['model_state_dict'])
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        print(f"Resumed from {args.resume}")
+        if rank == 0:
+            print(f"Resumed from {args.resume}")
 
     for epoch in range(cfg.train.epochs):
         model.train()
         total_loss = 0.0
-        optimizer.zero_grad(set_to_none=True)
 
-        iterator = tqdm(train_loader, desc=f"Epoch {epoch+1}")
+        if hasattr(sampler, 'set_epoch'):
+            sampler.set_epoch(epoch)
+
+        optimizer.zero_grad(set_to_none=True)
+        iterator = tqdm(train_loader, desc=f"Epoch {epoch+1}") if rank == 0 else train_loader
 
         for step, (images, labels) in enumerate(iterator):
             images, labels = images.to(device), labels.to(device)
@@ -322,38 +374,30 @@ def main():
 
         scheduler.step()
 
-        avg_loss = total_loss / len(train_loader)
-        acc, prec, rec, f1 = validate(model, val_loader, device)
-        gold_acc = validate_group_ranking(model, val_df, cfg, device, norm_stats=norm_stats)
-        lr = optimizer.param_groups[0]['lr']
+        if rank == 0:
+            avg_loss = total_loss / len(train_loader)
+            raw_val = model.module if hasattr(model, 'module') else model
+            acc, prec, rec, f1 = validate(raw_val, val_loader, device)
+            gold_acc = validate_group_ranking(model, val_df, cfg, device, norm_stats=norm_stats)
+            lr = optimizer.param_groups[0]['lr']
 
-        print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Acc: {acc:.2%} | "
-              f"P: {prec:.2%} R: {rec:.2%} F1: {f1:.2%} | GoldAcc: {gold_acc:.2%} | LR: {lr:.2e}")
+            print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Acc: {acc:.2%} | "
+                  f"P: {prec:.2%} R: {rec:.2%} F1: {f1:.2%} | GoldAcc: {gold_acc:.2%} | LR: {lr:.2e}")
 
-        # Track on gold_acc (group-level ranking metric)
-        if gold_acc > best_metric:
-            best_metric = gold_acc
-            patience_counter = 0
-            checkpoint = {
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-            }
-            torch.save(checkpoint, f"{cfg.train.save_dir}/last.pth")
-            torch.save(checkpoint, f"{cfg.train.save_dir}/best_model.pth")
-            print(f"  -> New best GoldAcc: {gold_acc:.2%}")
-        else:
-            patience_counter += 1
-            checkpoint = {
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-            }
-            torch.save(checkpoint, f"{cfg.train.save_dir}/last.pth")
+            if gold_acc > best_metric:
+                best_metric = gold_acc
+                patience_counter = 0
+                save_checkpoint(model, optimizer, epoch + 1, f"{cfg.train.save_dir}/last.pth", is_best=True)
+                print(f"  -> New best GoldAcc: {gold_acc:.2%}")
+            else:
+                patience_counter += 1
+                save_checkpoint(model, optimizer, epoch + 1, f"{cfg.train.save_dir}/last.pth", is_best=False)
 
-        if patience_counter >= patience:
-            print(f"Early stopping. Best GoldAcc: {best_metric:.2%}")
-            break
+            if patience_counter >= patience:
+                print(f"Early stopping. Best GoldAcc: {best_metric:.2%}")
+                break
+
+    cleanup_ddp()
 
 
 if __name__ == "__main__":
