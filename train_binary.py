@@ -146,7 +146,7 @@ def gold_set_loss(pred_scores, gt_scores, valid_len):
     return loss / count if count > 0 else pred_scores.sum() * 0.0
 
 
-def cross_batch_contrastive(pred_scores, gt_scores, valid_len, temperature=0.07,
+def cross_batch_contrastive(pred_scores, gt_scores, valid_len, temperature=1.0,
                             queue=None):
     """InfoNCE pooled across all groups in the batch.
 
@@ -155,8 +155,9 @@ def cross_batch_contrastive(pred_scores, gt_scores, valid_len, temperature=0.07,
     ~52 negatives instead of ~13. Optional score queue adds historical
     negatives for even larger pools.
 
-    L_i = -log( exp(s_pos_i/τ) / (exp(s_pos_i/τ) + Σ_j exp(s_neg_j/τ)) )
-        = CE(logits=[pos_i, neg_1, ..., neg_N], target=0)
+    Temperature note: CLIP uses τ=0.07 because cosine similarities are in
+    [-1,1]. Our model outputs unbounded raw scores, so τ≥1.0 to avoid
+    overflow.
     """
     all_pos = []
     all_neg = []
@@ -179,12 +180,17 @@ def cross_batch_contrastive(pred_scores, gt_scores, valid_len, temperature=0.07,
     pos = torch.cat(all_pos)  # (P,)
     neg = torch.cat(all_neg)  # (N,)
 
-    # Append historical negatives from queue
+    # Clamp to prevent overflow before exp()
+    pos = pos.clamp(-30, 30)
+    neg = neg.clamp(-30, 30)
+
+    # Append historical negatives from queue (detached, no grad)
     if queue is not None:
         queue_neg = queue.get()
         if queue_neg is not None:
             neg = torch.cat([neg, queue_neg.to(neg.device)])
-        queue.push(neg)
+        # Push current batch's live negatives (only the non-queued ones)
+        queue.push(all_neg)
 
     P, N = pos.shape[0], neg.shape[0]
 
@@ -208,8 +214,12 @@ class ScoreQueue:
         self.max_size = max_size
         self.buffer = []
 
-    def push(self, neg_scores):
-        self.buffer.append(neg_scores.detach())
+    def push(self, neg_score_list):
+        """neg_score_list: list of tensors from current batch."""
+        if not neg_score_list:
+            return
+        combined = torch.cat(neg_score_list).detach().cpu()
+        self.buffer.append(combined)
         total = sum(s.shape[0] for s in self.buffer)
         while total > self.max_size and len(self.buffer) > 1:
             total -= self.buffer[0].shape[0]

@@ -40,6 +40,6 @@ binary:
   lr_head: 0.001
   lr_backbone: 0.000005
   gradient_accumulation_steps: 2
-  contrastive_temperature: 0.07    # InfoNCE sharpness (CLIP uses 0.07)
+  contrastive_temperature: 1.0     # raw scores, not cosine sim — keep ≥1.0
   contrastive_weight: 1.0
   queue_size: 2048                 # historical negatives buffer
