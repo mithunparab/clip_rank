@@ -36,9 +36,9 @@ train:
 
 # Binary classification overrides (train_binary.py)
 binary:
-  lr_head: 0.0003
-  lr_backbone: 0.0000005
-  gradient_accumulation_steps: 32
+  lr_head: 0.001
+  lr_backbone: 0.000005
+  gradient_accumulation_steps: 4
   focal_alpha: 0.75
   focal_gamma: 2.0
-  focal_weight: 0.5
+  focal_weight: 1.0
