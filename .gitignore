@@ -25,5 +25,5 @@ venv/
 .DS_Store
 Thumbs.db
 
-.*csv
-dataset.csv
+*.csv
+Untitled
