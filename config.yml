@@ -34,11 +34,12 @@ train:
   # Ordinal (CORAL) training
   gold_weight: 3.0       # extra weight on gold-tier thresholds (7, 8, 9)
 
-# Binary classification overrides (train_binary.py)
+# Binary preference training overrides (train_binary.py)
 binary:
+  batch_size: 4                    # larger batch = more cross-batch negatives
   lr_head: 0.001
   lr_backbone: 0.000005
-  gradient_accumulation_steps: 4
-  focal_alpha: 0.75
-  focal_gamma: 2.0
-  focal_weight: 1.0
+  gradient_accumulation_steps: 2
+  contrastive_temperature: 0.07    # InfoNCE sharpness (CLIP uses 0.07)
+  contrastive_weight: 1.0
+  queue_size: 2048                 # historical negatives buffer

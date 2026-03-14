@@ -1,7 +1,11 @@
-"""End-to-end binary best-image trainer with Focal BCE + Gold-Set loss.
+"""End-to-end binary best-image trainer with cross-batch contrastive loss.
 
-Mirrors the proven train_ddp.py architecture (backbone fine-tuning + attention
-head) but with losses adapted for binary labels (selected=1 vs 0).
+Instead of comparing images within a single group (1 pos vs ~12 neg),
+pools all positives and negatives across the batch so each positive
+competes against ALL negatives — the same trick that makes CLIP work.
+
+Gold-set loss handles within-group ranking.
+Cross-batch InfoNCE handles global quality discrimination.
 
 Supports DDP multi-GPU:
     torchrun --nproc_per_node=2 train_binary.py
@@ -142,40 +146,79 @@ def gold_set_loss(pred_scores, gt_scores, valid_len):
     return loss / count if count > 0 else pred_scores.sum() * 0.0
 
 
-def focal_bce_loss(pred_scores, gt_scores, valid_len, alpha=0.75, gamma=2.0):
-    """Per-image focal BCE. Handles extreme class imbalance (~90% neg, ~10% pos).
-    Applied independently per image (flattened from groups)."""
-    all_logits = []
-    all_targets = []
+def cross_batch_contrastive(pred_scores, gt_scores, valid_len, temperature=0.07,
+                            queue=None):
+    """InfoNCE pooled across all groups in the batch.
+
+    Each positive competes against ALL negatives in the batch (not just its
+    own group). With batch_size=4 and ~13 neg/group, each positive faces
+    ~52 negatives instead of ~13. Optional score queue adds historical
+    negatives for even larger pools.
+
+    L_i = -log( exp(s_pos_i/τ) / (exp(s_pos_i/τ) + Σ_j exp(s_neg_j/τ)) )
+        = CE(logits=[pos_i, neg_1, ..., neg_N], target=0)
+    """
+    all_pos = []
+    all_neg = []
     for b in range(pred_scores.shape[0]):
         n = int(valid_len[b].item())
         if n < 2:
             continue
-        logits = pred_scores[b, :n].view(-1)
+        scores = pred_scores[b, :n].view(-1)
         gts = gt_scores[b, :n]
-        # Binary target: gold (score >= GOLD_THRESHOLD) = 1, else 0
-        targets = (gts >= GOLD_THRESHOLD).float()
-        all_logits.append(logits)
-        all_targets.append(targets)
+        pos_mask = gts >= GOLD_THRESHOLD
+        neg_mask = ~pos_mask
+        if pos_mask.any():
+            all_pos.append(scores[pos_mask])
+        if neg_mask.any():
+            all_neg.append(scores[neg_mask])
 
-    if not all_logits:
+    if not all_pos or not all_neg:
         return pred_scores.sum() * 0.0
 
-    logits = torch.cat(all_logits)
-    targets = torch.cat(all_targets)
+    pos = torch.cat(all_pos)  # (P,)
+    neg = torch.cat(all_neg)  # (N,)
 
-    # Standard BCE
-    bce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+    # Append historical negatives from queue
+    if queue is not None:
+        queue_neg = queue.get()
+        if queue_neg is not None:
+            neg = torch.cat([neg, queue_neg.to(neg.device)])
+        queue.push(neg)
 
-    # Focal modulation
-    probs = torch.sigmoid(logits)
-    p_t = targets * probs + (1 - targets) * (1 - probs)
-    focal_weight = (1 - p_t) ** gamma
+    P, N = pos.shape[0], neg.shape[0]
 
-    # Alpha weighting: alpha for positives, (1-alpha) for negatives
-    alpha_t = targets * alpha + (1 - targets) * (1 - alpha)
+    # InfoNCE: for each positive, classify it against all negatives
+    # logits: (P, 1+N) — column 0 is the positive, rest are negatives
+    logits = torch.cat([
+        (pos / temperature).unsqueeze(1),                     # (P, 1)
+        (neg / temperature).unsqueeze(0).expand(P, N),        # (P, N)
+    ], dim=1)
 
-    return (alpha_t * focal_weight * bce).mean()
+    # Target: index 0 is always the positive
+    targets = torch.zeros(P, dtype=torch.long, device=pos.device)
+    return F.cross_entropy(logits, targets)
+
+
+class ScoreQueue:
+    """Stores recent negative scores for larger contrastive pools.
+    Like MoCo's queue but for scalar scores — lightweight."""
+
+    def __init__(self, max_size=2048):
+        self.max_size = max_size
+        self.buffer = []
+
+    def push(self, neg_scores):
+        self.buffer.append(neg_scores.detach())
+        total = sum(s.shape[0] for s in self.buffer)
+        while total > self.max_size and len(self.buffer) > 1:
+            total -= self.buffer[0].shape[0]
+            self.buffer.pop(0)
+
+    def get(self):
+        if not self.buffer:
+            return None
+        return torch.cat(self.buffer)
 
 
 # ── Validation ────────────────────────────────────────────────────────
@@ -242,12 +285,13 @@ def main():
             return val
         return getattr(cfg.train, key, default)
 
-    lr_head = bcfg('lr_head', 3e-4)
-    lr_backbone = bcfg('lr_backbone', 5e-7)
-    accum_steps = bcfg('gradient_accumulation_steps', 32)
-    focal_alpha = bcfg('focal_alpha', 0.75)
-    focal_gamma = bcfg('focal_gamma', 2.0)
-    focal_weight = bcfg('focal_weight', 0.5)
+    lr_head = bcfg('lr_head', 1e-3)
+    lr_backbone = bcfg('lr_backbone', 5e-6)
+    accum_steps = bcfg('gradient_accumulation_steps', 4)
+    batch_size = bcfg('batch_size', cfg.train.batch_size)
+    contrast_temp = bcfg('contrastive_temperature', 0.07)
+    contrast_weight = bcfg('contrastive_weight', 1.0)
+    queue_size = bcfg('queue_size', 2048)
     warmup_epochs = getattr(cfg.train, 'warmup_epochs', 1)
 
     # Load data
@@ -280,12 +324,12 @@ def main():
         np.random.seed(seed + worker_id)
 
     train_loader = DataLoader(
-        train_ds, batch_size=cfg.train.batch_size, sampler=sampler,
+        train_ds, batch_size=batch_size, sampler=sampler,
         shuffle=(sampler is None),
         num_workers=cfg.system.num_workers, pin_memory=cfg.system.pin_memory,
         worker_init_fn=worker_init_fn)
     val_loader = DataLoader(
-        val_ds, batch_size=cfg.train.batch_size, shuffle=False,
+        val_ds, batch_size=batch_size, shuffle=False,
         num_workers=cfg.system.num_workers, pin_memory=cfg.system.pin_memory)
 
     # Model: full MobileCLIPRanker (backbone + attention head)
@@ -337,10 +381,11 @@ def main():
     patience = getattr(cfg.train, 'patience', 20)
     patience_counter = 0
     best_acc = 0.0
+    neg_queue = ScoreQueue(max_size=queue_size)
 
     if rank == 0:
         print(f"Training: {len(train_ds)} train, {len(val_ds)} val | "
-              f"GoldSet + FocalBCE(α={focal_alpha}, γ={focal_gamma}, w={focal_weight}) | "
+              f"GoldSet + CrossBatch(τ={contrast_temp}, w={contrast_weight}, Q={queue_size}) | "
               f"lr_head={lr_head:.1e}, lr_backbone={lr_backbone:.1e} | "
               f"accum={accum_steps} | AMP={use_amp}")
 
@@ -361,9 +406,10 @@ def main():
                 with torch.amp.autocast("cuda"):
                     preds = model(images, valid_lens=vlens)
                     gs = gold_set_loss(preds, scores, vlens)
-                    fb = focal_bce_loss(preds, scores, vlens,
-                                        alpha=focal_alpha, gamma=focal_gamma)
-                    loss = gs + focal_weight * fb
+                    cb = cross_batch_contrastive(preds, scores, vlens,
+                                                 temperature=contrast_temp,
+                                                 queue=neg_queue)
+                    loss = gs + contrast_weight * cb
                     loss = loss / accum_steps
 
                 scaler.scale(loss).backward()
