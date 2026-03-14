@@ -3,7 +3,9 @@
 Mirrors the proven train_ddp.py architecture (backbone fine-tuning + attention
 head) but with losses adapted for binary labels (selected=1 vs 0).
 
-Usage:
+Supports DDP multi-GPU:
+    torchrun --nproc_per_node=2 train_binary.py
+Single GPU:
     python train_binary.py
 """
 import os
@@ -14,6 +16,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 import pandas as pd
 import numpy as np
 from PIL import Image
@@ -27,6 +32,21 @@ GOLD_THRESHOLD = 7.0  # selected=10 is gold
 
 # Inference compatibility: same architecture as MobileCLIPRanker
 BinaryClassifier = MobileCLIPRanker
+
+
+def setup_ddp():
+    if "RANK" in os.environ:
+        dist.init_process_group(backend="nccl")
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        return rank, local_rank
+    return 0, 0
+
+
+def cleanup_ddp():
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 # ── Dataset ───────────────────────────────────────────────────────────
@@ -183,11 +203,25 @@ def validate(model, val_loader, device):
 
 # ── Training ──────────────────────────────────────────────────────────
 
+def save_checkpoint(model, optimizer, epoch, path, is_best=False):
+    raw_model = model.module if hasattr(model, "module") else model
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': raw_model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+    }
+    torch.save(checkpoint, path)
+    if is_best:
+        best_path = os.path.join(os.path.dirname(path), "best_model.pth")
+        torch.save(checkpoint, best_path)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--resume', type=str, default=None)
     args = parser.parse_args()
 
+    rank, local_rank = setup_ddp()
     cfg = load_config("config.yml")
 
     seed = getattr(cfg.train, 'seed', 42)
@@ -198,7 +232,7 @@ def main():
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    device = torch.device(cfg.system.device if torch.cuda.is_available() else "cpu")
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     os.makedirs(cfg.train.save_dir, exist_ok=True)
 
     # Helper to read binary config with fallback to train config
@@ -240,11 +274,14 @@ def main():
         is_train=False, img_size=cfg.data.img_size,
         max_per_group=max_pg, norm_stats=norm_stats)
 
+    sampler = DistributedSampler(train_ds, shuffle=True, seed=seed) if dist.is_initialized() else None
+
     def worker_init_fn(worker_id):
         np.random.seed(seed + worker_id)
 
     train_loader = DataLoader(
-        train_ds, batch_size=cfg.train.batch_size, shuffle=True,
+        train_ds, batch_size=cfg.train.batch_size, sampler=sampler,
+        shuffle=(sampler is None),
         num_workers=cfg.system.num_workers, pin_memory=cfg.system.pin_memory,
         worker_init_fn=worker_init_fn)
     val_loader = DataLoader(
@@ -260,10 +297,14 @@ def main():
         ckpt = torch.load(args.resume, map_location=device)
         model.load_state_dict(ckpt['model_state_dict'])
         start_epoch = ckpt.get('epoch', 0)
-        print(f"Resumed from {args.resume} (epoch {start_epoch})")
+        if rank == 0:
+            print(f"Resumed from {args.resume} (epoch {start_epoch})")
+
+    if dist.is_initialized():
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
     # Differential LR: backbone vs head
-    raw_model = model
+    raw_model = model.module if hasattr(model, "module") else model
     backbone_params = []
     head_params = []
     for name, param in raw_model.named_parameters():
@@ -274,7 +315,8 @@ def main():
         else:
             backbone_params.append(param)
 
-    print(f"Trainable params: backbone={len(backbone_params)}, head={len(head_params)}")
+    if rank == 0:
+        print(f"Trainable params: backbone={len(backbone_params)}, head={len(head_params)}")
 
     optimizer = optim.AdamW([
         {'params': backbone_params, 'lr': lr_backbone},
@@ -296,17 +338,22 @@ def main():
     patience_counter = 0
     best_acc = 0.0
 
-    print(f"Training: {len(train_ds)} train, {len(val_ds)} val | "
-          f"GoldSet + FocalBCE(α={focal_alpha}, γ={focal_gamma}, w={focal_weight}) | "
-          f"lr_head={lr_head:.1e}, lr_backbone={lr_backbone:.1e} | "
-          f"accum={accum_steps} | AMP={use_amp}")
+    if rank == 0:
+        print(f"Training: {len(train_ds)} train, {len(val_ds)} val | "
+              f"GoldSet + FocalBCE(α={focal_alpha}, γ={focal_gamma}, w={focal_weight}) | "
+              f"lr_head={lr_head:.1e}, lr_backbone={lr_backbone:.1e} | "
+              f"accum={accum_steps} | AMP={use_amp}")
 
     for epoch in range(start_epoch, cfg.train.epochs):
         model.train()
         total_loss = 0.0
+
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+
         optimizer.zero_grad(set_to_none=True)
 
-        iterator = tqdm(train_loader, desc=f"Epoch {epoch+1}")
+        iterator = tqdm(train_loader, desc=f"Epoch {epoch+1}") if rank == 0 else train_loader
         for step, (images, scores, vlens) in enumerate(iterator):
             images, scores, vlens = images.to(device), scores.to(device), vlens.to(device)
 
@@ -345,35 +392,30 @@ def main():
             total_loss += loss.item() * accum_steps
 
         scheduler.step()
-        avg_loss = total_loss / len(train_loader)
-        gold_acc = validate(model, val_loader, device)
-        current_lr_bb = optimizer.param_groups[0]['lr']
-        current_lr_hd = optimizer.param_groups[1]['lr']
 
-        print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | GoldAcc: {gold_acc:.2%} | "
-              f"LR: bb={current_lr_bb:.2e} hd={current_lr_hd:.2e}")
+        if rank == 0:
+            avg_loss = total_loss / len(train_loader)
+            raw_val = model.module if hasattr(model, 'module') else model
+            gold_acc = validate(raw_val, val_loader, device)
+            current_lr_bb = optimizer.param_groups[0]['lr']
+            current_lr_hd = optimizer.param_groups[1]['lr']
 
-        checkpoint = {
-            'epoch': epoch + 1,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-        }
+            print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | GoldAcc: {gold_acc:.2%} | "
+                  f"LR: bb={current_lr_bb:.2e} hd={current_lr_hd:.2e}")
 
-        if gold_acc > best_acc:
-            best_acc = gold_acc
-            patience_counter = 0
-            torch.save(checkpoint, f"{cfg.train.save_dir}/best_model.pth")
-            print(f"  -> New best GoldAcc: {gold_acc:.2%}")
-        else:
-            patience_counter += 1
+            if gold_acc > best_acc:
+                best_acc = gold_acc
+                patience_counter = 0
+                save_checkpoint(model, optimizer, epoch + 1, f"{cfg.train.save_dir}/last.pth", is_best=True)
+            else:
+                patience_counter += 1
+                save_checkpoint(model, optimizer, epoch + 1, f"{cfg.train.save_dir}/last.pth", is_best=False)
 
-        torch.save(checkpoint, f"{cfg.train.save_dir}/last.pth")
+            if patience_counter >= patience:
+                print(f"Early stopping. Best GoldAcc: {best_acc:.2%}")
+                break
 
-        if patience_counter >= patience:
-            print(f"Early stopping. Best GoldAcc: {best_acc:.2%}")
-            break
-
-    print(f"Done. Best GoldAcc: {best_acc:.2%}")
+    cleanup_ddp()
 
 
 if __name__ == "__main__":
