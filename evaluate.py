@@ -220,7 +220,7 @@ def print_report(rank_distribution, total, failed):
 
 if __name__ == "__main__":
     # Kaggle paths
-    KAGGLE_DIR = "/kaggle/inputs/ranking"
+    KAGGLE_DIR = "/kaggle/input/datasets/mithunparab/ranking"
     # Local fallbacks
     LOCAL_CSV = "ranking_model_vs_ground_truth_2days.csv"
 
