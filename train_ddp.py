@@ -31,18 +31,12 @@ def cleanup_ddp():
         dist.destroy_process_group()
 
 
-def gold_set_loss(pred_scores, gt_scores, valid_len, hard_k=0, label_smooth=0.1):
+def gold_set_loss(pred_scores, gt_scores, valid_len):
     """
-    Direct gold-accuracy surrogate with label smoothing.
+    Direct gold-accuracy surrogate: -log P(argmax ∈ gold).
 
-    Loss = logsumexp(pred[all]) - logsumexp(pred[gold])
-         = -log P(argmax ∈ gold)
-
-    Label smoothing prevents the model from becoming overconfident on
-    training gold images, which causes the validation oscillation we see.
-
-    When hard_k > 0: only compete against the top-k hardest non-gold
-    predictions. Concentrates gradient on the decision boundary.
+    Full pool — every non-gold competes. No hard_k subsetting, because
+    training against top-k doesn't match validation which uses all images.
 
     For gold-free groups: standard top-1 CE (best raw score).
     """
@@ -60,20 +54,7 @@ def gold_set_loss(pred_scores, gt_scores, valid_len, hard_k=0, label_smooth=0.1)
         gold_mask = gts >= 7
         if gold_mask.any() and not gold_mask.all():
             gold_logits = logits[gold_mask]
-
-            if hard_k > 0:
-                # Only compete against top-k hardest non-gold
-                non_gold = logits[~gold_mask]
-                k = min(hard_k, non_gold.shape[0])
-                hard_neg = non_gold.topk(k).values
-                pool = torch.cat([gold_logits, hard_neg])
-            else:
-                pool = logits
-
-            # Smoothed: (1-ε) * gold_loss + ε * uniform_loss
-            gold_loss = torch.logsumexp(pool, dim=0) - torch.logsumexp(gold_logits, dim=0)
-            uniform_loss = torch.logsumexp(pool, dim=0) + torch.log(torch.tensor(float(pool.shape[0]), device=pool.device))
-            loss += (1 - label_smooth) * gold_loss + label_smooth * uniform_loss
+            loss += torch.logsumexp(logits, dim=0) - torch.logsumexp(gold_logits, dim=0)
             count += 1
         else:
             max_score = gts.max()
@@ -330,9 +311,6 @@ def main():
     os.makedirs(cfg.train.save_dir, exist_ok=True)
 
     # Config
-    temperature = getattr(cfg.train, 'temperature', 0.3)   # PL prediction temperature
-    margin_weight = getattr(cfg.train, 'margin_weight', 0.1)  # PL loss weight (low — prioritize top-1)
-    hard_k = getattr(cfg.train, 'hard_k', 3)  # gold_set focuses on top-k hardest non-gold
     accum_steps = getattr(cfg.train, 'gradient_accumulation_steps', 4)
     warmup_epochs = getattr(cfg.train, 'warmup_epochs', 1)
     use_cached = args.cached or getattr(cfg.train, 'use_cached_features', False)
@@ -425,7 +403,7 @@ def main():
     patience_counter = 0
 
     if rank == 0:
-        print(f"Training on {len(train_ds)} groups | GoldSet(hard_k={hard_k}) + PL(T={temperature}, w={margin_weight}) | "
+        print(f"Training on {len(train_ds)} groups | GoldSet only (full pool) | "
               f"accum_steps={accum_steps} | warmup={warmup_epochs} | AMP={use_amp}")
 
     for epoch in range(start_epoch, cfg.train.epochs):
@@ -445,10 +423,7 @@ def main():
             if use_amp:
                 with torch.amp.autocast("cuda"):
                     preds = model(data, vlen)
-                    gs = gold_set_loss(preds, scores, vlen, hard_k=hard_k)
-                    pl = plackett_luce_loss(preds, scores, vlen, temperature=temperature)
-                    loss = gs + margin_weight * pl
-                    loss = loss / accum_steps
+                    loss = gold_set_loss(preds, scores, vlen) / accum_steps
 
                 scaler.scale(loss).backward()
 
@@ -461,10 +436,7 @@ def main():
                     ema.update(model)
             else:
                 preds = model(data, vlen)
-                gs = gold_set_loss(preds, scores, vlen)
-                pl = plackett_luce_loss(preds, scores, vlen, temperature=temperature)
-                loss = gs + margin_weight * pl
-                loss = loss / accum_steps
+                loss = gold_set_loss(preds, scores, vlen) / accum_steps
 
                 loss.backward()
 
