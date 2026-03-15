@@ -4,12 +4,17 @@ Evaluate a trained ranker against real ground-truth data.
 Usage:
     python evaluate.py --csv /path/to/ground_truth.csv \
                        --model /path/to/best_model.pth \
-                       [--config config.yml]
+                       [--config config.yml] [--workers 8]
+
+Parallelization:
+    - Properties split across all available GPUs (torch.multiprocessing)
+    - Image downloads parallelized with ThreadPoolExecutor per property
 
 Expected CSV: property_id, image_url, is_ground_truth (TRUE/FALSE), ...
 """
 
 import torch
+import torch.multiprocessing as mp
 import requests
 import yaml
 import argparse
@@ -17,6 +22,7 @@ import os
 import glob
 import csv
 import time
+from concurrent.futures import ThreadPoolExecutor
 from PIL import Image
 from io import BytesIO
 from types import SimpleNamespace
@@ -37,14 +43,28 @@ def load_config(path="config.yml"):
     return recursive_namespace(cfg_dict)
 
 
+def _download_one(src, process_fn):
+    """Download and preprocess a single image. Returns (url, tensor) or None."""
+    if not src or not isinstance(src, str):
+        return None
+    try:
+        if src.startswith("http"):
+            resp = requests.get(src, timeout=10)
+            img = Image.open(BytesIO(resp.content)).convert('RGB')
+        else:
+            img = Image.open(src).convert('RGB')
+        return (src, process_fn(img))
+    except Exception:
+        return None
+
+
 class PropertyRanker:
-    def __init__(self, model_path, config_path='config.yml', device=None):
+    def __init__(self, model_path, config_path='config.yml', device=None, download_workers=8):
         self.cfg = load_config(config_path)
         self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.download_workers = download_workers
 
-        print(f"--- Loading Ranker ---")
-        print(f"Device: {self.device}")
-        print(f"Loading Weights: {model_path}")
+        print(f"[{self.device}] Loading {model_path}")
 
         checkpoint = torch.load(model_path, map_location=self.device)
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
@@ -58,18 +78,13 @@ class PropertyRanker:
 
         # Auto-detect head type from checkpoint keys
         has_attn = any('head.attn.' in k for k in new_state_dict)
-        if has_attn:
-            self.cfg.model.use_attention = True
-            print("Detected attention head in checkpoint")
-        else:
-            self.cfg.model.use_attention = False
-            print("Detected independent head in checkpoint")
+        self.cfg.model.use_attention = has_attn
+        print(f"[{self.device}] Head: {'attention' if has_attn else 'independent'}")
 
         self.model = MobileCLIPRanker(self.cfg)
         self.model.load_state_dict(new_state_dict)
         self.model.to(self.device)
         self.model.eval()
-        print("Model loaded successfully.\n")
 
         norm_mean, norm_std = get_norm_stats(self.cfg.model.name)
         self.process = transforms.Compose([
@@ -80,35 +95,24 @@ class PropertyRanker:
         ])
 
     def rank(self, image_list):
-        valid_tensors = []
-        valid_urls = []
+        # Parallel image download
+        with ThreadPoolExecutor(max_workers=self.download_workers) as pool:
+            futures = [pool.submit(_download_one, src, self.process) for src in image_list]
+            results_raw = [f.result() for f in futures]
 
-        for src in image_list:
-            if not src or not isinstance(src, str):
-                continue
-            try:
-                if src.startswith("http"):
-                    resp = requests.get(src, timeout=10)
-                    img = Image.open(BytesIO(resp.content)).convert('RGB')
-                else:
-                    img = Image.open(src).convert('RGB')
-                valid_tensors.append(self.process(img))
-                valid_urls.append(src)
-            except Exception as e:
-                print(f"  Skip: {e}")
-
-        if not valid_tensors:
+        valid = [(url, t) for r in results_raw if r is not None for url, t in [r]]
+        if not valid:
             return []
+
+        valid_urls = [v[0] for v in valid]
+        valid_tensors = [v[1] for v in valid]
 
         with torch.no_grad():
             batch = torch.stack(valid_tensors).unsqueeze(0).to(self.device)
             valid_len = torch.tensor([len(valid_tensors)]).to(self.device)
             raw_scores = self.model(batch, valid_lens=valid_len).view(-1).cpu().numpy()
 
-        results = []
-        for i, score in enumerate(raw_scores):
-            results.append({'url': valid_urls[i], 'score': float(score)})
-
+        results = [{'url': valid_urls[i], 'score': float(s)} for i, s in enumerate(raw_scores)]
         results.sort(key=lambda x: x['score'], reverse=True)
         return results
 
@@ -132,14 +136,14 @@ def load_csv(csv_path):
     return dict(properties)
 
 
-def evaluate(ranker, properties):
+def evaluate_shard(gpu_id, prop_ids, properties, model_path, config_path, download_workers, return_dict):
+    """Evaluate a shard of properties on a single GPU."""
+    device = f"cuda:{gpu_id}"
+    ranker = PropertyRanker(model_path, config_path, device=device, download_workers=download_workers)
+
     rank_distribution = defaultdict(int)
     total = 0
     failed = 0
-    results_log = []
-
-    prop_ids = list(properties.keys())
-    print(f"Evaluating {len(prop_ids)} properties...\n")
 
     for i, pid in enumerate(prop_ids):
         prop = properties[pid]
@@ -152,7 +156,7 @@ def evaluate(ranker, properties):
 
         if (i + 1) % 50 == 0:
             correct_so_far = rank_distribution.get(1, 0)
-            print(f"  [{i+1}/{len(prop_ids)}] Accuracy so far: {correct_so_far}/{total} = {correct_so_far/total*100:.1f}%")
+            print(f"  [GPU {gpu_id}] [{i+1}/{len(prop_ids)}] Accuracy: {correct_so_far}/{total} = {correct_so_far/total*100:.1f}%")
 
         ranked = ranker.rank(prop['images'])
 
@@ -160,7 +164,6 @@ def evaluate(ranker, properties):
             failed += 1
             continue
 
-        # Find ground truth rank in model's ranking
         gt_rank = None
         for r, item in enumerate(ranked):
             if item['url'] == gt_url:
@@ -172,17 +175,12 @@ def evaluate(ranker, properties):
             continue
 
         rank_distribution[gt_rank] += 1
-        results_log.append({
-            'property_id': pid,
-            'total_images': len(prop['images']),
-            'gt_rank': gt_rank,
-            'model_top_url': ranked[0]['url'],
-            'model_top_score': ranked[0]['score'],
-            'gt_url': gt_url,
-            'gt_score': next(r['score'] for r in ranked if r['url'] == gt_url),
-        })
 
-    return rank_distribution, total, failed, results_log
+    return_dict[gpu_id] = {
+        'rank_distribution': dict(rank_distribution),
+        'total': total,
+        'failed': failed,
+    }
 
 
 def print_report(rank_distribution, total, failed):
@@ -230,9 +228,10 @@ def main():
     parser.add_argument("--csv", required=True, help="Path to ground-truth CSV")
     parser.add_argument("--model", default=None, help="Path to model checkpoint")
     parser.add_argument("--config", default="config.yml")
+    parser.add_argument("--workers", type=int, default=8, help="Download threads per GPU")
     args = parser.parse_args()
 
-    # Auto-detect model if not provided
+    # Auto-detect model
     model_path = args.model
     if not model_path:
         if os.path.exists("checkpoints/best_model.pth"):
@@ -251,16 +250,94 @@ def main():
     print(f"Model : {model_path}")
 
     properties = load_csv(args.csv)
-    print(f"Loaded {len(properties)} properties\n")
 
-    ranker = PropertyRanker(model_path=model_path, config_path=args.config)
+    # Filter to evaluable properties
+    eval_pids = [pid for pid, p in properties.items() if p['ground_truth'] and len(p['images']) >= 2]
+    print(f"Loaded {len(properties)} properties, {len(eval_pids)} evaluable\n")
+
+    n_gpus = torch.cuda.device_count()
+    if n_gpus < 2:
+        # Single GPU / CPU fallback
+        print(f"Using 1 GPU\n")
+        ranker = PropertyRanker(model_path, args.config, download_workers=args.workers)
+        start = time.time()
+
+        rank_distribution = defaultdict(int)
+        total = 0
+        failed = 0
+
+        for i, pid in enumerate(eval_pids):
+            prop = properties[pid]
+            total += 1
+
+            if (i + 1) % 50 == 0:
+                correct = rank_distribution.get(1, 0)
+                print(f"  [{i+1}/{len(eval_pids)}] Accuracy: {correct}/{total} = {correct/total*100:.1f}%")
+
+            ranked = ranker.rank(prop['images'])
+            if not ranked:
+                failed += 1
+                continue
+
+            gt_rank = None
+            for r, item in enumerate(ranked):
+                if item['url'] == prop['ground_truth']:
+                    gt_rank = r + 1
+                    break
+            if gt_rank is None:
+                failed += 1
+                continue
+            rank_distribution[gt_rank] += 1
+
+        elapsed = time.time() - start
+        print_report(dict(rank_distribution), total, failed)
+        print(f"  Total eval time: {elapsed:.1f}s")
+        return
+
+    # Multi-GPU: split properties across GPUs
+    print(f"Using {n_gpus} GPUs\n")
+
+    shards = [[] for _ in range(n_gpus)]
+    for i, pid in enumerate(eval_pids):
+        shards[i % n_gpus].append(pid)
+
+    for g in range(n_gpus):
+        print(f"  GPU {g}: {len(shards[g])} properties")
+    print()
+
+    mp.set_start_method('spawn', force=True)
+    manager = mp.Manager()
+    return_dict = manager.dict()
 
     start = time.time()
-    rank_dist, total, failed, results_log = evaluate(ranker, properties)
+    processes = []
+    for gpu_id in range(n_gpus):
+        p = mp.Process(
+            target=evaluate_shard,
+            args=(gpu_id, shards[gpu_id], properties, model_path, args.config, args.workers, return_dict)
+        )
+        p.start()
+        processes.append(p)
+
+    for p in processes:
+        p.join()
+
     elapsed = time.time() - start
 
-    print_report(rank_dist, total, failed)
-    print(f"  Total eval time: {elapsed:.1f}s")
+    # Merge results from all GPUs
+    merged_dist = defaultdict(int)
+    merged_total = 0
+    merged_failed = 0
+
+    for gpu_id in range(n_gpus):
+        result = return_dict[gpu_id]
+        for rank, count in result['rank_distribution'].items():
+            merged_dist[rank] += count
+        merged_total += result['total']
+        merged_failed += result['failed']
+
+    print_report(dict(merged_dist), merged_total, merged_failed)
+    print(f"  Total eval time: {elapsed:.1f}s ({n_gpus} GPUs)")
 
 
 if __name__ == "__main__":
