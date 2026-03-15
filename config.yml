@@ -17,6 +17,7 @@ model:
   name: "mobileclip2_l14"
   head_hidden_dim: 256
   head_dropout: 0.1
+  use_attention: false
   unfreeze_last: 20
 
 train:

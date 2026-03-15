@@ -155,6 +155,28 @@ class BirderBackboneWrapper(nn.Module):
         return self.net(x)
 
 
+class IndependentHead(nn.Module):
+    """Per-image MLP head — scores each image independently.
+
+    No cross-image interaction. Each image gets a score based only on
+    its own features. Transfers better to production because the score
+    doesn't depend on what other images happen to be in the group.
+    """
+    def __init__(self, in_dim, hidden_dim=256, dropout=0.1):
+        super().__init__()
+        self.norm = nn.LayerNorm(in_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, x, valid_lens=None):
+        # x: (B, G, in_dim) → (B, G, 1)
+        return self.mlp(self.norm(x))
+
+
 class RankingHead(nn.Module):
     """Cross-image self-attention + MLP head.
 
@@ -162,9 +184,9 @@ class RankingHead(nn.Module):
     independently. Equivalent to one transformer encoder layer over
     the group, followed by a per-image MLP projection.
 
-    Human annotators judge images comparatively — this makes the model
-    do the same. A mediocre photo looks worse when the group contains
-    a gold image; the attention lets the model detect this contrast.
+    Warning: boosts validation GoldAcc but hurts real-world accuracy
+    because attention patterns are group-composition-dependent and
+    don't transfer to production groups with different characteristics.
     """
     def __init__(self, in_dim, hidden_dim=256, dropout=0.1):
         super().__init__()
@@ -183,10 +205,6 @@ class RankingHead(nn.Module):
         )
 
         # Zero-init the attention output projection so attn_out=0 at epoch 0.
-        # The residual x + attn_out = x initially → identical to the old
-        # independent MLP head. Attention activates gradually as it learns
-        # meaningful cross-image comparisons. Without this, random attention
-        # corrupts backbone features and causes a performance drop.
         nn.init.zeros_(self.attn.out_proj.weight)
         nn.init.zeros_(self.attn.out_proj.bias)
 
@@ -278,7 +296,12 @@ class MobileCLIPRanker(nn.Module):
 
         head_hidden = getattr(cfg.model, "head_hidden_dim", 256)
         head_dropout = getattr(cfg.model, "head_dropout", 0.1)
-        self.head = RankingHead(self.backbone_dim, head_hidden, head_dropout)
+        use_attention = getattr(cfg.model, "use_attention", False)
+
+        if use_attention:
+            self.head = RankingHead(self.backbone_dim, head_hidden, head_dropout)
+        else:
+            self.head = IndependentHead(self.backbone_dim, head_hidden, head_dropout)
 
     def _find_unfrozen_modules(self):
         """Find the highest-level backbone submodules containing unfrozen params."""
