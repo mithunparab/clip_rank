@@ -31,19 +31,16 @@ def cleanup_ddp():
         dist.destroy_process_group()
 
 
-def gold_set_loss(pred_scores, gt_scores, valid_len):
+def gold_set_loss(pred_scores, gt_scores, valid_len, hard_k=0):
     """
     Direct gold-accuracy surrogate.
 
-    P(argmax ∈ gold) = Σ_{i:gold} softmax(pred)_i
-                     = exp(logsumexp(pred[gold])) / exp(logsumexp(pred))
+    Loss = logsumexp(pred[all]) - logsumexp(pred[gold])
+         = -log P(argmax ∈ gold)
 
-    Loss = -log P(argmax ∈ gold)
-         = logsumexp(pred[all]) - logsumexp(pred[gold])
-
-    Unlike CE on a single best image or mean log-prob over golds, this
-    is the exact expression for "probability that any gold image wins",
-    which is what gold_acc measures.
+    When hard_k > 0: only compete against the top-k hardest non-gold
+    predictions. Concentrates gradient on the decision boundary —
+    the near-gold images the model confuses with gold.
 
     For gold-free groups: standard top-1 CE (best raw score).
     """
@@ -60,7 +57,18 @@ def gold_set_loss(pred_scores, gt_scores, valid_len):
 
         gold_mask = gts >= 7
         if gold_mask.any() and not gold_mask.all():
-            loss += torch.logsumexp(logits, dim=0) - torch.logsumexp(logits[gold_mask], dim=0)
+            gold_logits = logits[gold_mask]
+
+            if hard_k > 0:
+                # Only compete against top-k hardest non-gold
+                non_gold = logits[~gold_mask]
+                k = min(hard_k, non_gold.shape[0])
+                hard_neg = non_gold.topk(k).values
+                pool = torch.cat([gold_logits, hard_neg])
+            else:
+                pool = logits
+
+            loss += torch.logsumexp(pool, dim=0) - torch.logsumexp(gold_logits, dim=0)
             count += 1
         else:
             max_score = gts.max()
@@ -287,7 +295,8 @@ def main():
 
     # Config
     temperature = getattr(cfg.train, 'temperature', 0.3)   # PL prediction temperature
-    margin_weight = getattr(cfg.train, 'margin_weight', 0.3)  # PL loss weight
+    margin_weight = getattr(cfg.train, 'margin_weight', 0.1)  # PL loss weight (low — prioritize top-1)
+    hard_k = getattr(cfg.train, 'hard_k', 3)  # gold_set focuses on top-k hardest non-gold
     accum_steps = getattr(cfg.train, 'gradient_accumulation_steps', 4)
     warmup_epochs = getattr(cfg.train, 'warmup_epochs', 1)
     use_cached = args.cached or getattr(cfg.train, 'use_cached_features', False)
@@ -368,7 +377,7 @@ def main():
     patience_counter = 0
 
     if rank == 0:
-        print(f"Training on {len(train_ds)} groups | GoldSet + PL(T={temperature}, w={margin_weight}) | "
+        print(f"Training on {len(train_ds)} groups | GoldSet(hard_k={hard_k}) + PL(T={temperature}, w={margin_weight}) | "
               f"accum_steps={accum_steps} | warmup={warmup_epochs} | AMP={use_amp}")
 
     for epoch in range(cfg.train.epochs):
@@ -388,7 +397,7 @@ def main():
             if use_amp:
                 with torch.amp.autocast("cuda"):
                     preds = model(data, vlen)
-                    gs = gold_set_loss(preds, scores, vlen)
+                    gs = gold_set_loss(preds, scores, vlen, hard_k=hard_k)
                     pl = plackett_luce_loss(preds, scores, vlen, temperature=temperature)
                     loss = gs + margin_weight * pl
                     loss = loss / accum_steps
