@@ -21,17 +21,18 @@ model:
 
 train:
   batch_size: 2
-  lr_head: 0.0002
-  lr_backbone: 0.000001
+  lr_head: 0.0005
+  lr_backbone: 0.000003
   epochs: 50
   weight_decay: 0.01
   grad_clip: 1.0
   seed: 42
   save_dir: "checkpoints"
-  patience: 20
+  patience: 10
   # GoldSet + Plackett-Luce losses
   temperature: 1.0       # PL prediction temperature (1.0 = standard)
   margin_weight: 0.3     # weight for PL ranking loss
-  warmup_epochs: 5
-  gradient_accumulation_steps: 4
+  warmup_epochs: 1
+  gradient_accumulation_steps: 8
+  eta_min: 0.0000005     # LR floor — don't let learning die
   use_cached_features: false
