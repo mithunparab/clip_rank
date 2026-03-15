@@ -56,6 +56,15 @@ class PropertyRanker:
         for k, v in state_dict.items():
             new_state_dict[k.replace("module.", "")] = v
 
+        # Auto-detect head type from checkpoint keys
+        has_attn = any('head.attn.' in k for k in new_state_dict)
+        if has_attn:
+            self.cfg.model.use_attention = True
+            print("Detected attention head in checkpoint")
+        else:
+            self.cfg.model.use_attention = False
+            print("Detected independent head in checkpoint")
+
         self.model = MobileCLIPRanker(self.cfg)
         self.model.load_state_dict(new_state_dict)
         self.model.to(self.device)
