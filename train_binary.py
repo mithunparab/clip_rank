@@ -1,11 +1,6 @@
-"""End-to-end binary best-image trainer with cross-batch contrastive loss.
+"""Binary best-image trainer — gold_set loss only.
 
-Instead of comparing images within a single group (1 pos vs ~12 neg),
-pools all positives and negatives across the batch so each positive
-competes against ALL negatives — the same trick that makes CLIP work.
-
-Gold-set loss handles within-group ranking.
-Cross-batch InfoNCE handles global quality discrimination.
+Single loss that directly optimizes the metric: P(any selected image wins).
 
 Supports DDP multi-GPU:
     torchrun --nproc_per_node=2 train_binary.py
@@ -16,7 +11,6 @@ import os
 import argparse
 import random
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
@@ -34,7 +28,7 @@ from utils import load_config
 BINARY_CSV = "best_image_training_data.csv"
 GOLD_THRESHOLD = 7.0  # selected=10 is gold
 
-# Inference compatibility: same architecture as MobileCLIPRanker
+# Inference compatibility
 BinaryClassifier = MobileCLIPRanker
 
 
@@ -56,8 +50,8 @@ def cleanup_ddp():
 # ── Dataset ───────────────────────────────────────────────────────────
 
 class BinaryGroupDataset(Dataset):
-    """Groups images by property_id, maps selected=1→10.0, selected=0→0.0.
-    Pads to max_per_group. Filters: ≥2 images AND at least 1 positive."""
+    """Groups by property_id. selected=1→10.0, selected=0→0.0.
+    Filters: ≥2 images AND at least 1 positive."""
 
     def __init__(self, df, images_dir="images", is_train=False, img_size=224,
                  max_per_group=15, norm_stats=None):
@@ -82,7 +76,6 @@ class BinaryGroupDataset(Dataset):
                 transforms.Normalize(mean=mean, std=std),
             ])
 
-        # Build groups
         self.groups = []
         for _, group in df.groupby('group_id'):
             items = []
@@ -126,11 +119,11 @@ class BinaryGroupDataset(Dataset):
             return torch.zeros(3, self.img_size, self.img_size)
 
 
-# ── Losses ────────────────────────────────────────────────────────────
+# ── Loss ──────────────────────────────────────────────────────────────
 
 def gold_set_loss(pred_scores, gt_scores, valid_len):
     """P(argmax ∈ gold) loss: logsumexp(all) - logsumexp(gold).
-    Directly optimizes gold accuracy metric."""
+    Directly optimizes gold accuracy metric. Nothing else."""
     loss = 0.0
     count = 0
     for b in range(pred_scores.shape[0]):
@@ -146,95 +139,9 @@ def gold_set_loss(pred_scores, gt_scores, valid_len):
     return loss / count if count > 0 else pred_scores.sum() * 0.0
 
 
-def cross_batch_contrastive(pred_scores, gt_scores, valid_len, temperature=1.0,
-                            queue=None):
-    """InfoNCE pooled across all groups in the batch.
-
-    Each positive competes against ALL negatives in the batch (not just its
-    own group). With batch_size=4 and ~13 neg/group, each positive faces
-    ~52 negatives instead of ~13. Optional score queue adds historical
-    negatives for even larger pools.
-
-    Temperature note: CLIP uses τ=0.07 because cosine similarities are in
-    [-1,1]. Our model outputs unbounded raw scores, so τ≥1.0 to avoid
-    overflow.
-    """
-    all_pos = []
-    all_neg = []
-    for b in range(pred_scores.shape[0]):
-        n = int(valid_len[b].item())
-        if n < 2:
-            continue
-        scores = pred_scores[b, :n].view(-1)
-        gts = gt_scores[b, :n]
-        pos_mask = gts >= GOLD_THRESHOLD
-        neg_mask = ~pos_mask
-        if pos_mask.any():
-            all_pos.append(scores[pos_mask])
-        if neg_mask.any():
-            all_neg.append(scores[neg_mask])
-
-    if not all_pos or not all_neg:
-        return pred_scores.sum() * 0.0
-
-    pos = torch.cat(all_pos)  # (P,)
-    neg = torch.cat(all_neg)  # (N,)
-
-    # Clamp to prevent overflow before exp()
-    pos = pos.clamp(-30, 30)
-    neg = neg.clamp(-30, 30)
-
-    # Append historical negatives from queue (detached, no grad)
-    if queue is not None:
-        queue_neg = queue.get()
-        if queue_neg is not None:
-            neg = torch.cat([neg, queue_neg.to(neg.device)])
-        # Push current batch's live negatives (only the non-queued ones)
-        queue.push(all_neg)
-
-    P, N = pos.shape[0], neg.shape[0]
-
-    # InfoNCE: for each positive, classify it against all negatives
-    # logits: (P, 1+N) — column 0 is the positive, rest are negatives
-    logits = torch.cat([
-        (pos / temperature).unsqueeze(1),                     # (P, 1)
-        (neg / temperature).unsqueeze(0).expand(P, N),        # (P, N)
-    ], dim=1)
-
-    # Target: index 0 is always the positive
-    targets = torch.zeros(P, dtype=torch.long, device=pos.device)
-    return F.cross_entropy(logits, targets)
-
-
-class ScoreQueue:
-    """Stores recent negative scores for larger contrastive pools.
-    Like MoCo's queue but for scalar scores — lightweight."""
-
-    def __init__(self, max_size=2048):
-        self.max_size = max_size
-        self.buffer = []
-
-    def push(self, neg_score_list):
-        """neg_score_list: list of tensors from current batch."""
-        if not neg_score_list:
-            return
-        combined = torch.cat(neg_score_list).detach().cpu()
-        self.buffer.append(combined)
-        total = sum(s.shape[0] for s in self.buffer)
-        while total > self.max_size and len(self.buffer) > 1:
-            total -= self.buffer[0].shape[0]
-            self.buffer.pop(0)
-
-    def get(self):
-        if not self.buffer:
-            return None
-        return torch.cat(self.buffer)
-
-
 # ── Validation ────────────────────────────────────────────────────────
 
 def validate(model, val_loader, device):
-    """GoldAcc: does argmax(pred) land on a selected=1 image?"""
     model.eval()
     hits = total = 0
     with torch.no_grad():
@@ -288,7 +195,6 @@ def main():
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     os.makedirs(cfg.train.save_dir, exist_ok=True)
 
-    # Helper to read binary config with fallback to train config
     def bcfg(key, default=None):
         val = getattr(getattr(cfg, 'binary', None), key, None)
         if val is not None:
@@ -299,16 +205,14 @@ def main():
     lr_backbone = bcfg('lr_backbone', 5e-6)
     accum_steps = bcfg('gradient_accumulation_steps', 4)
     batch_size = bcfg('batch_size', cfg.train.batch_size)
-    contrast_temp = bcfg('contrastive_temperature', 0.07)
-    contrast_weight = bcfg('contrastive_weight', 1.0)
-    queue_size = bcfg('queue_size', 2048)
     warmup_epochs = getattr(cfg.train, 'warmup_epochs', 1)
 
     # Load data
     df = pd.read_csv(BINARY_CSV)
     df = df.rename(columns={'property_id': 'group_id', 'image_url': 'url'})
     df['file_path'] = df.index.map(lambda x: os.path.join('images', f"{x}.jpg"))
-    print(f"Binary data: {len(df)} images, {df['group_id'].nunique()} groups")
+    if rank == 0:
+        print(f"Binary data: {len(df)} images, {df['group_id'].nunique()} groups")
 
     # Train/val split by group
     rng = np.random.RandomState(seed)
@@ -342,10 +246,8 @@ def main():
         val_ds, batch_size=batch_size, shuffle=False,
         num_workers=cfg.system.num_workers, pin_memory=cfg.system.pin_memory)
 
-    # Model: full MobileCLIPRanker (backbone + attention head)
     model = MobileCLIPRanker(cfg).to(device)
 
-    # Resume from checkpoint if specified
     start_epoch = 0
     if args.resume and os.path.exists(args.resume):
         ckpt = torch.load(args.resume, map_location=device)
@@ -357,7 +259,6 @@ def main():
     if dist.is_initialized():
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
-    # Differential LR: backbone vs head
     raw_model = model.module if hasattr(model, "module") else model
     backbone_params = []
     head_params = []
@@ -370,14 +271,13 @@ def main():
             backbone_params.append(param)
 
     if rank == 0:
-        print(f"Trainable params: backbone={len(backbone_params)}, head={len(head_params)}")
+        print(f"Trainable: backbone={len(backbone_params)}, head={len(head_params)}")
 
     optimizer = optim.AdamW([
         {'params': backbone_params, 'lr': lr_backbone},
         {'params': head_params, 'lr': lr_head},
     ], weight_decay=cfg.train.weight_decay)
 
-    # Warmup → cosine annealing
     warmup_sched = optim.lr_scheduler.LinearLR(
         optimizer, start_factor=1.0 / max(warmup_epochs, 1), total_iters=warmup_epochs)
     cosine_sched = optim.lr_scheduler.CosineAnnealingLR(
@@ -388,16 +288,14 @@ def main():
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda") if use_amp else None
 
-    patience = getattr(cfg.train, 'patience', 20)
+    patience = getattr(cfg.train, 'patience', 10)
     patience_counter = 0
     best_acc = 0.0
-    neg_queue = ScoreQueue(max_size=queue_size)
 
     if rank == 0:
-        print(f"Training: {len(train_ds)} train, {len(val_ds)} val | "
-              f"GoldSet + CrossBatch(τ={contrast_temp}, w={contrast_weight}, Q={queue_size}) | "
+        print(f"GoldSet only | {len(train_ds)} train, {len(val_ds)} val | "
               f"lr_head={lr_head:.1e}, lr_backbone={lr_backbone:.1e} | "
-              f"accum={accum_steps} | AMP={use_amp}")
+              f"batch={batch_size}, accum={accum_steps} | AMP={use_amp}")
 
     for epoch in range(start_epoch, cfg.train.epochs):
         model.train()
@@ -415,12 +313,7 @@ def main():
             if use_amp:
                 with torch.amp.autocast("cuda"):
                     preds = model(images, valid_lens=vlens)
-                    gs = gold_set_loss(preds, scores, vlens)
-                    cb = cross_batch_contrastive(preds, scores, vlens,
-                                                 temperature=contrast_temp,
-                                                 queue=neg_queue)
-                    loss = gs + contrast_weight * cb
-                    loss = loss / accum_steps
+                    loss = gold_set_loss(preds, scores, vlens) / accum_steps
 
                 scaler.scale(loss).backward()
 
@@ -432,11 +325,7 @@ def main():
                     optimizer.zero_grad(set_to_none=True)
             else:
                 preds = model(images, valid_lens=vlens)
-                gs = gold_set_loss(preds, scores, vlens)
-                fb = focal_bce_loss(preds, scores, vlens,
-                                    alpha=focal_alpha, gamma=focal_gamma)
-                loss = gs + focal_weight * fb
-                loss = loss / accum_steps
+                loss = gold_set_loss(preds, scores, vlens) / accum_steps
 
                 loss.backward()
 
@@ -468,7 +357,7 @@ def main():
                 save_checkpoint(model, optimizer, epoch + 1, f"{cfg.train.save_dir}/last.pth", is_best=False)
 
             if patience_counter >= patience:
-                print(f"Early stopping. Best GoldAcc: {best_acc:.2%}")
+                print(f"Early stopping at epoch {epoch+1}. Best GoldAcc: {best_acc:.2%}")
                 break
 
     cleanup_ddp()

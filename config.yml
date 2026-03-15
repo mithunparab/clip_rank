@@ -28,18 +28,15 @@ train:
   grad_clip: 1.0
   seed: 42
   save_dir: "checkpoints"
-  patience: 20
+  patience: 10
   warmup_epochs: 0
   gradient_accumulation_steps: 32
   # Ordinal (CORAL) training
   gold_weight: 3.0       # extra weight on gold-tier thresholds (7, 8, 9)
 
-# Binary preference training overrides (train_binary.py)
+# Binary training overrides (train_binary.py)
 binary:
-  batch_size: 4                    # larger batch = more cross-batch negatives
+  batch_size: 4
   lr_head: 0.001
   lr_backbone: 0.000005
-  gradient_accumulation_steps: 2
-  contrastive_temperature: 1.0     # raw scores, not cosine sim — keep ≥1.0
-  contrastive_weight: 1.0
-  queue_size: 2048                 # historical negatives buffer
+  gradient_accumulation_steps: 4
