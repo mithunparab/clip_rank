@@ -16,14 +16,14 @@ model:
   # mobileclip2_s0 | mobileclip2_s3 | mobileclip2_b | mobileclip2_l14
   name: "mobileclip2_l14"
   head_hidden_dim: 256
-  head_dropout: 0.1
-  unfreeze_last: 200
+  head_dropout: 0.15
+  unfreeze_last: 0
 
 train:
   batch_size: 2
-  lr_head: 0.0005
-  lr_backbone: 0.000003
-  epochs: 50
+  lr_head: 0.001
+  lr_backbone: 0.0
+  epochs: 60
   weight_decay: 0.01
   grad_clip: 1.0
   seed: 42
@@ -31,9 +31,9 @@ train:
   patience: 10
   # GoldSet + Plackett-Luce losses
   temperature: 1.0       # PL prediction temperature (1.0 = standard)
-  margin_weight: 0.1     # PL weight (low — top-1 matters more than full ranking)
+  margin_weight: 0.05    # PL weight (low — top-1 matters more than full ranking)
   hard_k: 3              # gold_set competes against top-k hardest non-gold only
-  warmup_epochs: 1
+  warmup_epochs: 2
   gradient_accumulation_steps: 8
   eta_min: 0.0000005     # LR floor — don't let learning die
   use_cached_features: false

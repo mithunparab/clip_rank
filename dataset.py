@@ -1,3 +1,4 @@
+import random
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
@@ -18,6 +19,7 @@ GOLD_THRESHOLD = 7.0  # scores in [-10, 10]; gold = 7-10
 class PropertyPreferenceDataset(Dataset):
     def __init__(self, df, images_dir="images", is_train=False, img_size=224):
         self.img_size = img_size
+        self.is_train = is_train
         self.df = df.copy()
 
         if 'file_path' not in self.df.columns:
@@ -61,7 +63,9 @@ class PropertyPreferenceDataset(Dataset):
         return len(self.groups)
 
     def __getitem__(self, idx):
-        records = self.groups[idx]
+        records = list(self.groups[idx])
+        if self.is_train:
+            random.shuffle(records)
         selected = records[:15]
 
         tensors = []

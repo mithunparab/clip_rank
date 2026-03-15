@@ -31,16 +31,18 @@ def cleanup_ddp():
         dist.destroy_process_group()
 
 
-def gold_set_loss(pred_scores, gt_scores, valid_len, hard_k=0):
+def gold_set_loss(pred_scores, gt_scores, valid_len, hard_k=0, label_smooth=0.1):
     """
-    Direct gold-accuracy surrogate.
+    Direct gold-accuracy surrogate with label smoothing.
 
     Loss = logsumexp(pred[all]) - logsumexp(pred[gold])
          = -log P(argmax ∈ gold)
 
+    Label smoothing prevents the model from becoming overconfident on
+    training gold images, which causes the validation oscillation we see.
+
     When hard_k > 0: only compete against the top-k hardest non-gold
-    predictions. Concentrates gradient on the decision boundary —
-    the near-gold images the model confuses with gold.
+    predictions. Concentrates gradient on the decision boundary.
 
     For gold-free groups: standard top-1 CE (best raw score).
     """
@@ -68,7 +70,10 @@ def gold_set_loss(pred_scores, gt_scores, valid_len, hard_k=0):
             else:
                 pool = logits
 
-            loss += torch.logsumexp(pool, dim=0) - torch.logsumexp(gold_logits, dim=0)
+            # Smoothed: (1-ε) * gold_loss + ε * uniform_loss
+            gold_loss = torch.logsumexp(pool, dim=0) - torch.logsumexp(gold_logits, dim=0)
+            uniform_loss = torch.logsumexp(pool, dim=0) + torch.log(torch.tensor(float(pool.shape[0]), device=pool.device))
+            loss += (1 - label_smooth) * gold_loss + label_smooth * uniform_loss
             count += 1
         else:
             max_score = gts.max()
@@ -260,6 +265,37 @@ def _validate_cached(model, df_val, device, cache_dir):
     return gold_acc, spearman, ndcg
 
 
+class EMA:
+    """Exponential Moving Average of model parameters.
+
+    Smooths out training oscillations — the averaged weights are more
+    stable than any single epoch's snapshot, which is exactly what we
+    need when GoldAcc oscillates between 63-77%.
+    """
+    def __init__(self, model, decay=0.998):
+        self.decay = decay
+        raw = model.module if hasattr(model, 'module') else model
+        self.shadow = {k: v.clone().detach() for k, v in raw.state_dict().items()}
+
+    @torch.no_grad()
+    def update(self, model):
+        raw = model.module if hasattr(model, 'module') else model
+        for k, v in raw.state_dict().items():
+            if k in self.shadow:
+                self.shadow[k].mul_(self.decay).add_(v, alpha=1 - self.decay)
+
+    def apply(self, model):
+        """Swap EMA weights into model for validation."""
+        raw = model.module if hasattr(model, 'module') else model
+        self.backup = {k: v.clone() for k, v in raw.state_dict().items()}
+        raw.load_state_dict(self.shadow)
+
+    def restore(self, model):
+        """Restore original weights after validation."""
+        raw = model.module if hasattr(model, 'module') else model
+        raw.load_state_dict(self.backup)
+
+
 def save_checkpoint(model, optimizer, epoch, path, is_best=False):
     raw_model = model.module if hasattr(model, "module") else model
     checkpoint = {
@@ -339,6 +375,15 @@ def main():
     device = torch.device(f"cuda:{local_rank}")
     model = MobileCLIPRanker(cfg).to(device)
 
+    # Resume from checkpoint (load weights before DDP wrapping)
+    start_epoch = 0
+    if args.resume:
+        if rank == 0:
+            print(f"Resuming from {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device, weights_only=True)
+        model.load_state_dict(ckpt['model_state_dict'])
+        start_epoch = ckpt.get('epoch', 0)
+
     if dist.is_initialized():
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
@@ -353,10 +398,10 @@ def main():
         else:
             backbone_params.append(param)
 
-    optimizer = optim.AdamW([
-        {'params': backbone_params, 'lr': cfg.train.lr_backbone},
-        {'params': head_params, 'lr': cfg.train.lr_head}
-    ], weight_decay=cfg.train.weight_decay)
+    param_groups = [{'params': head_params, 'lr': cfg.train.lr_head}]
+    if backbone_params:
+        param_groups.append({'params': backbone_params, 'lr': cfg.train.lr_backbone})
+    optimizer = optim.AdamW(param_groups, weight_decay=cfg.train.weight_decay)
 
     eta_min = getattr(cfg.train, 'eta_min', 1e-7)
     warmup_sched = optim.lr_scheduler.LinearLR(
@@ -372,6 +417,9 @@ def main():
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda") if use_amp else None
 
+    ema_decay = getattr(cfg.train, 'ema_decay', 0.998)
+    ema = EMA(model, decay=ema_decay)
+
     best_acc = 0.0
     patience = getattr(cfg.train, 'patience', 15)
     patience_counter = 0
@@ -380,7 +428,7 @@ def main():
         print(f"Training on {len(train_ds)} groups | GoldSet(hard_k={hard_k}) + PL(T={temperature}, w={margin_weight}) | "
               f"accum_steps={accum_steps} | warmup={warmup_epochs} | AMP={use_amp}")
 
-    for epoch in range(cfg.train.epochs):
+    for epoch in range(start_epoch, cfg.train.epochs):
         model.train()
         total_loss = 0.0
 
@@ -410,6 +458,7 @@ def main():
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad(set_to_none=True)
+                    ema.update(model)
             else:
                 preds = model(data, vlen)
                 gs = gold_set_loss(preds, scores, vlen)
@@ -423,6 +472,7 @@ def main():
                     torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
+                    ema.update(model)
 
             total_loss += loss.item() * accum_steps  # undo scaling for logging
 
@@ -430,6 +480,9 @@ def main():
 
         if rank == 0:
             avg_loss = total_loss / len(train_loader)
+
+            # Validate with EMA weights for smoother metric tracking
+            ema.apply(model)
             raw_val = model.module if hasattr(model, 'module') else model
             gold_acc, spearman, ndcg = validate(raw_val, val_df, cfg, device, use_cached=use_cached, cache_dir=cache_dir)
 
@@ -439,14 +492,26 @@ def main():
             if gold_acc > best_acc:
                 best_acc = gold_acc
                 patience_counter = 0
+                # Save EMA weights as best — they generalize better
                 save_checkpoint(model, optimizer, epoch + 1, f"{cfg.train.save_dir}/last.pth", is_best=True)
             else:
                 patience_counter += 1
                 save_checkpoint(model, optimizer, epoch + 1, f"{cfg.train.save_dir}/last.pth", is_best=False)
 
+            ema.restore(model)
+
             if patience_counter >= patience:
                 print(f"Early stopping. Best GoldAcc: {best_acc:.2%}")
+
+        # Broadcast early-stop decision to all ranks so they break together
+        if dist.is_initialized():
+            stop_flag = torch.tensor([1 if (rank == 0 and patience_counter >= patience) else 0],
+                                     device=device)
+            dist.broadcast(stop_flag, src=0)
+            if stop_flag.item() == 1:
                 break
+        elif patience_counter >= patience:
+            break
 
     cleanup_ddp()
 
