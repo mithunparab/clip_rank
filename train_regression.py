@@ -145,9 +145,10 @@ def _collect_val_preds_cached(model, df_val, device, cache_dir):
 def validate_regression(model, df_val, cfg, device, use_cached=False, cache_dir="cached_features"):
     """Compute regression-oriented metrics across the full val set.
 
-    Primary: mean_gt_top1pct — average GT score of the model's predicted top-1%.
-             This is what matters for "pick the best image to stage".
-    Supporting: precision@top-1%, global Spearman, MAE, per-group gold_acc.
+    Primary: top1_acc — per-group, did the model's highest-scoring image match
+             the ground-truth highest-scoring image? Mirrors evaluate.py's metric.
+             Ties at GT max all count as correct.
+    Supporting: mean_gt_top1pct, precision@top-1%, Spearman, MAE, gold_acc.
     """
     from scipy.stats import spearmanr
     model.eval()
@@ -155,13 +156,33 @@ def validate_regression(model, df_val, cfg, device, use_cached=False, cache_dir=
     preds, gts, group_ids = _collect_val_preds(model, df_val, cfg, device, use_cached, cache_dir)
     n = len(preds)
     if n == 0:
-        return {'mean_gt_top1pct': 0.0, 'precision_1pct': 0.0,
+        return {'top1_acc': 0.0, 'mean_gt_top1pct': 0.0, 'precision_1pct': 0.0,
                 'spearman': 0.0, 'mae': 0.0, 'gold_acc': 0.0}
 
+    # Per-group top-1: did the model's argmax land on a GT-max image?
+    top1_hits, top1_total = 0, 0
+    gold_hits, gold_total = 0, 0
+    for gid in np.unique(group_ids):
+        m = group_ids == gid
+        g_preds = preds[m]
+        g_gts = gts[m]
+        if len(g_gts) < 2:
+            continue
+        gt_max = g_gts.max()
+        best_mask = g_gts == gt_max
+        top1_hits += int(best_mask[int(np.argmax(g_preds))])
+        top1_total += 1
+        if gt_max >= 7:
+            gold_hits += int(g_gts[int(np.argmax(g_preds))] >= 7)
+            gold_total += 1
+
+    top1_acc = top1_hits / top1_total if top1_total > 0 else 0.0
+    gold_acc = gold_hits / gold_total if gold_total > 0 else 0.0
+
+    # Global top-1% — kept for cross-property insight but no longer primary.
     k = max(1, n // 100)
     pred_top_idx = np.argsort(-preds)[:k]
     gt_top_set = set(np.argsort(-gts)[:k].tolist())
-
     mean_gt_top1pct = float(gts[pred_top_idx].mean())
     precision_1pct = len(set(pred_top_idx.tolist()) & gt_top_set) / k
 
@@ -170,21 +191,10 @@ def validate_regression(model, df_val, cfg, device, use_cached=False, cache_dir=
         spearman = float(rho) if not np.isnan(rho) else 0.0
     else:
         spearman = 0.0
-
     mae = float(np.abs(preds - gts).mean())
 
-    # Per-group gold accuracy — carried over from train_ddp for comparison
-    hits, total = 0, 0
-    for gid in np.unique(group_ids):
-        m = group_ids == gid
-        g_preds = preds[m]
-        g_gts = gts[m]
-        if g_gts.max() >= 7:
-            hits += int(g_gts[int(np.argmax(g_preds))] >= 7)
-            total += 1
-    gold_acc = hits / total if total > 0 else 0.0
-
     return {
+        'top1_acc': top1_acc,
         'mean_gt_top1pct': mean_gt_top1pct,
         'precision_1pct': precision_1pct,
         'spearman': spearman,
@@ -317,7 +327,7 @@ def main():
         print(f"Training on {n_eff_groups} groups (raw={n_raw_groups}, "
               f"oversample={'off' if args.no_oversample else f'{oversample_bins}-bin cap={oversample_cap}x'}) | "
               f"Huber(δ={huber_delta}) | accum={accum_steps} | AMP={use_amp}")
-        print(f"Primary metric: mean_gt_top1pct (higher = better images picked for staging)")
+        print(f"Primary metric: top1_acc (per-group: model's #1 pick == a GT-max image)")
 
     for epoch in range(start_epoch, cfg.train.epochs):
         model.train()
@@ -372,13 +382,14 @@ def main():
             current_lr = optimizer.param_groups[0]['lr']
             print(
                 f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | "
+                f"Top1Acc: {m['top1_acc']:.2%} | "
+                f"GoldAcc: {m['gold_acc']:.2%} | "
                 f"MeanGT@top1%: {m['mean_gt_top1pct']:.3f} | "
-                f"Prec@top1%: {m['precision_1pct']:.2%} | "
                 f"Spearman: {m['spearman']:.4f} | MAE: {m['mae']:.3f} | "
-                f"GoldAcc: {m['gold_acc']:.2%} | LR: {current_lr:.2e}"
+                f"LR: {current_lr:.2e}"
             )
 
-            primary = m['mean_gt_top1pct']
+            primary = m['top1_acc']
             if primary > best_metric:
                 best_metric = primary
                 patience_counter = 0
@@ -392,7 +403,7 @@ def main():
             ema.restore(model)
 
             if patience_counter >= patience:
-                print(f"Early stopping. Best MeanGT@top1%: {best_metric:.3f}")
+                print(f"Early stopping. Best Top1Acc: {best_metric:.2%}")
 
         if dist.is_initialized():
             stop_flag = torch.tensor([1 if (rank == 0 and patience_counter >= patience) else 0],
