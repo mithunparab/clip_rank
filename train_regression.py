@@ -51,6 +51,37 @@ def huber_loss(preds, targets, valid_lens, delta=1.0):
     return per_elem.sum() / denom
 
 
+def within_group_softmax_ce(preds, targets, valid_lens):
+    """Within-group softmax CE targeting the GT-max image (Plackett-Luce@k=1).
+
+    Directly optimizes "model's argmax == GT's argmax" per group. Ignores
+    absolute score scale — only the relative ordering inside each group
+    matters, which is exactly what top1_acc measures.
+
+    Ties at GT max: uniform soft target over tied-top images. Groups where
+    every image has the same GT score are skipped (no learning signal).
+    """
+    loss = 0.0
+    count = 0
+    for b in range(preds.shape[0]):
+        n = int(valid_lens[b].item())
+        if n < 2:
+            continue
+        p = preds[b, :n].view(-1)
+        g = targets[b, :n]
+        gt_max = g.max()
+        best_mask = (g == gt_max)
+        if best_mask.all():
+            # No #1 vs #2 distinction possible
+            continue
+        log_probs = F.log_softmax(p, dim=0)
+        loss = loss + (-log_probs[best_mask].mean())
+        count += 1
+    if count > 0:
+        return loss / count
+    return preds.sum() * 0.0
+
+
 def oversample_groups_by_decile(groups, n_bins=10, cap_ratio=8.0):
     """Replicate group references so rare-score bins appear more often.
 
@@ -157,11 +188,15 @@ def validate_regression(model, df_val, cfg, device, use_cached=False, cache_dir=
     n = len(preds)
     if n == 0:
         return {'top1_acc': 0.0, 'mean_gt_top1pct': 0.0, 'precision_1pct': 0.0,
-                'spearman': 0.0, 'mae': 0.0, 'gold_acc': 0.0}
+                'spearman': 0.0, 'mae': 0.0, 'gold_acc': 0.0,
+                'miss_gap_p50': 0.0, 'miss_gap_p90': 0.0, 'miss_gap_near': 0.0}
 
     # Per-group top-1: did the model's argmax land on a GT-max image?
+    # Also collect miss-gap stats: model_top_pred - best_gt_pred.
+    # Small gap = near-tied (ceiling territory); large gap = confident error.
     top1_hits, top1_total = 0, 0
     gold_hits, gold_total = 0, 0
+    miss_gaps = []
     for gid in np.unique(group_ids):
         m = group_ids == gid
         g_preds = preds[m]
@@ -170,14 +205,25 @@ def validate_regression(model, df_val, cfg, device, use_cached=False, cache_dir=
             continue
         gt_max = g_gts.max()
         best_mask = g_gts == gt_max
-        top1_hits += int(best_mask[int(np.argmax(g_preds))])
+        model_argmax = int(np.argmax(g_preds))
+        hit = bool(best_mask[model_argmax])
+        top1_hits += int(hit)
         top1_total += 1
+        if not hit:
+            miss_gaps.append(float(g_preds[model_argmax] - g_preds[best_mask].max()))
         if gt_max >= 7:
-            gold_hits += int(g_gts[int(np.argmax(g_preds))] >= 7)
+            gold_hits += int(g_gts[model_argmax] >= 7)
             gold_total += 1
 
     top1_acc = top1_hits / top1_total if top1_total > 0 else 0.0
     gold_acc = gold_hits / gold_total if gold_total > 0 else 0.0
+    if miss_gaps:
+        gaps = np.array(miss_gaps)
+        miss_gap_p50 = float(np.median(gaps))
+        miss_gap_p90 = float(np.percentile(gaps, 90))
+        miss_gap_near = float((gaps < 0.1).mean())  # fraction of misses that are near-tied
+    else:
+        miss_gap_p50 = miss_gap_p90 = miss_gap_near = 0.0
 
     # Global top-1% — kept for cross-property insight but no longer primary.
     k = max(1, n // 100)
@@ -200,6 +246,9 @@ def validate_regression(model, df_val, cfg, device, use_cached=False, cache_dir=
         'spearman': spearman,
         'mae': mae,
         'gold_acc': gold_acc,
+        'miss_gap_p50': miss_gap_p50,
+        'miss_gap_p90': miss_gap_p90,
+        'miss_gap_near': miss_gap_near,
     }
 
 
@@ -233,6 +282,14 @@ def main():
     huber_delta = getattr(cfg.train, 'huber_delta', 1.0)
     oversample_bins = getattr(cfg.train, 'oversample_bins', 10)
     oversample_cap = getattr(cfg.train, 'oversample_cap', 8.0)
+    loss_kind = getattr(cfg.train, 'loss', 'softmax_ce')  # 'softmax_ce' | 'huber'
+
+    def _compute_loss(preds, scores, vlen):
+        if loss_kind == 'softmax_ce':
+            return within_group_softmax_ce(preds, scores, vlen)
+        if loss_kind == 'huber':
+            return huber_loss(preds, scores, vlen, delta=huber_delta)
+        raise ValueError(f"Unknown loss '{loss_kind}' — expected 'softmax_ce' or 'huber'")
 
     df = pd.read_csv(cfg.data.csv_path)
     if 'file_path' not in df.columns:
@@ -324,9 +381,10 @@ def main():
     patience_counter = 0
 
     if rank == 0:
+        loss_desc = 'softmax_CE(within-group)' if loss_kind == 'softmax_ce' else f'Huber(δ={huber_delta})'
         print(f"Training on {n_eff_groups} groups (raw={n_raw_groups}, "
               f"oversample={'off' if args.no_oversample else f'{oversample_bins}-bin cap={oversample_cap}x'}) | "
-              f"Huber(δ={huber_delta}) | accum={accum_steps} | AMP={use_amp}")
+              f"Loss={loss_desc} | accum={accum_steps} | AMP={use_amp}")
         print(f"Primary metric: top1_acc (per-group: model's #1 pick == a GT-max image)")
 
     for epoch in range(start_epoch, cfg.train.epochs):
@@ -346,7 +404,7 @@ def main():
             if use_amp:
                 with torch.amp.autocast("cuda"):
                     preds = model(data, vlen)
-                    loss = huber_loss(preds, scores, vlen, delta=huber_delta) / accum_steps
+                    loss = _compute_loss(preds, scores, vlen) / accum_steps
                 scaler.scale(loss).backward()
 
                 if (step + 1) % accum_steps == 0 or (step + 1) == len(train_loader):
@@ -358,7 +416,7 @@ def main():
                     ema.update(model)
             else:
                 preds = model(data, vlen)
-                loss = huber_loss(preds, scores, vlen, delta=huber_delta) / accum_steps
+                loss = _compute_loss(preds, scores, vlen) / accum_steps
                 loss.backward()
 
                 if (step + 1) % accum_steps == 0 or (step + 1) == len(train_loader):
@@ -384,9 +442,9 @@ def main():
                 f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | "
                 f"Top1Acc: {m['top1_acc']:.2%} | "
                 f"GoldAcc: {m['gold_acc']:.2%} | "
-                f"MeanGT@top1%: {m['mean_gt_top1pct']:.3f} | "
-                f"Spearman: {m['spearman']:.4f} | MAE: {m['mae']:.3f} | "
-                f"LR: {current_lr:.2e}"
+                f"MissGap p50/p90: {m['miss_gap_p50']:+.3f}/{m['miss_gap_p90']:+.3f} | "
+                f"NearMiss: {m['miss_gap_near']:.1%} | "
+                f"Spearman: {m['spearman']:.4f} | LR: {current_lr:.2e}"
             )
 
             primary = m['top1_acc']
