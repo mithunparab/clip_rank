@@ -12,14 +12,49 @@ Usage:
 
 import os
 import argparse
-import html as html_lib
 import numpy as np
 import pandas as pd
 import torch
+from PIL import Image, ImageDraw, ImageFont
 
 from dataset import PropertyPreferenceDataset, _remap_score
 from model import MobileCLIPRanker
 from utils import load_config
+
+
+THUMB_W, THUMB_H = 420, 315
+CAPTION_H = 60
+GAP = 20
+PAGE_PAD = 20
+
+
+def _thumb(path_or_url):
+    """Load a local image as an RGB PIL thumbnail. Returns placeholder on failure."""
+    img = None
+    try:
+        if path_or_url and os.path.exists(path_or_url):
+            img = Image.open(path_or_url).convert('RGB')
+    except Exception:
+        img = None
+    if img is None:
+        img = Image.new('RGB', (THUMB_W, THUMB_H), (60, 60, 60))
+    img = img.copy()
+    img.thumbnail((THUMB_W, THUMB_H), Image.LANCZOS)
+    # Pad to uniform size
+    canvas = Image.new('RGB', (THUMB_W, THUMB_H), (20, 20, 20))
+    canvas.paste(img, ((THUMB_W - img.width) // 2, (THUMB_H - img.height) // 2))
+    return canvas
+
+
+def _load_font(size):
+    for p in ('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+             '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+             '/System/Library/Fonts/Helvetica.ttc'):
+        try:
+            return ImageFont.truetype(p, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
 
 
 def main():
@@ -27,7 +62,8 @@ def main():
     parser.add_argument('--model', default='checkpoints/best_model.pth')
     parser.add_argument('--config', default='config.yml')
     parser.add_argument('--n', type=int, default=30, help='number of misses to show')
-    parser.add_argument('--out', default='misses.html')
+    parser.add_argument('--out', default='misses.jpg',
+                        help='Output image file (jpg/png). Viewable in notebook or image viewer.')
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -98,63 +134,56 @@ def main():
     misses.sort(key=lambda m: m['gap'], reverse=True)
     misses = misses[:args.n]
     total = sum(1 for _ in val_df.groupby('group_id'))
-    print(f"Showing top {len(misses)} confident misses (of ~{total} val groups) in {args.out}")
+    print(f"Rendering top {len(misses)} confident misses (of ~{total} val groups) → {args.out}")
 
-    parts = [
-        '<!DOCTYPE html>',
-        '<html><head><meta charset="utf-8"><title>Val-set misses</title>',
-        '<style>',
-        'body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:20px;max-width:1400px;}',
-        '.row{display:flex;gap:20px;margin:24px 0;padding:16px;background:#1c1c1c;border-radius:8px;}',
-        '.cell{flex:1;min-width:0;}',
-        '.cell img{width:100%;height:auto;border-radius:4px;display:block;}',
-        '.cell h3{margin:0 0 6px 0;font-size:14px;}',
-        '.wrong h3{color:#ff7070;}',
-        '.right h3{color:#70ff70;}',
-        '.meta{font-size:12px;color:#aaa;margin-top:6px;line-height:1.5;}',
-        '.header{font-size:12px;color:#888;margin-bottom:6px;}',
-        'h1{font-size:20px;} p{color:#bbb;}',
-        '</style>',
-        '</head><body>',
-        f'<h1>Top {len(misses)} val misses — most confidently wrong first</h1>',
-        '<p>Left = model\'s #1 pick (wrong). Right = a GT-max image (what the model should\'ve picked). '
-        'If ≥30% of these look like defensible calls, the ~60% ceiling is annotator subjectivity. '
-        'If the model\'s picks are clearly worse, there is room to improve with model/training changes.</p>',
-    ]
+    if not misses:
+        print("No misses found — either the model is perfect or val is empty.")
+        return
 
+    # Two thumbnails side by side + caption below. Pack rows into a single tall image.
+    row_w = THUMB_W * 2 + GAP * 3
+    row_h = THUMB_H + CAPTION_H + GAP
+    img_w = row_w + PAGE_PAD * 2
+    img_h = PAGE_PAD * 2 + row_h * len(misses)
+
+    canvas = Image.new('RGB', (img_w, img_h), (17, 17, 17))
+    draw = ImageDraw.Draw(canvas)
+    font_title = _load_font(16)
+    font_meta = _load_font(13)
+
+    y = PAGE_PAD
     for i, m in enumerate(misses):
-        gid = html_lib.escape(str(m['group_id']))
-        mp = m['model_pick']
-        gp = m['gt_pick']
-        model_src = html_lib.escape(mp.get('url') or mp['file_path'])
-        gt_src = html_lib.escape(gp.get('url') or gp['file_path'])
-        model_label = html_lib.escape(str(mp.get('label', '') or ''))
-        gt_label = html_lib.escape(str(gp.get('label', '') or ''))
-        ties_note = f' (1 of {m["n_tied_top"]} tied at top)' if m['n_tied_top'] > 1 else ''
+        mp, gp = m['model_pick'], m['gt_pick']
+        x_left = PAGE_PAD + GAP
+        x_right = x_left + THUMB_W + GAP
 
-        parts.append(
-            f'<div class="row">'
-            f'<div class="cell wrong">'
-            f'<div class="header">#{i+1} · group {gid} · gap +{m["gap"]:.2f}</div>'
-            f'<h3>Model\'s #1 pick (wrong)</h3>'
-            f'<img src="{model_src}" loading="lazy">'
-            f'<div class="meta">label: {model_label or "—"}<br>'
-            f'GT score: {m["model_gt"]:.1f} · pred: {m["model_pred"]:.2f}</div>'
-            f'</div>'
-            f'<div class="cell right">'
-            f'<div class="header">&nbsp;</div>'
-            f'<h3>GT top pick{ties_note}</h3>'
-            f'<img src="{gt_src}" loading="lazy">'
-            f'<div class="meta">label: {gt_label or "—"}<br>'
-            f'GT score: {m["gt_gt"]:.1f} · pred: {m["gt_pred"]:.2f}</div>'
-            f'</div>'
-            f'</div>'
-        )
+        canvas.paste(_thumb(mp['file_path']), (x_left, y))
+        canvas.paste(_thumb(gp['file_path']), (x_right, y))
 
-    parts.append('</body></html>')
-    with open(args.out, 'w') as f:
-        f.write('\n'.join(parts))
-    print(f"Open {args.out} in a browser.")
+        cap_y = y + THUMB_H + 6
+        ties = f"  (1 of {m['n_tied_top']} tied top)" if m['n_tied_top'] > 1 else ''
+        draw.text((x_left, cap_y),
+                  f"#{i+1}  group {m['group_id']}  gap +{m['gap']:.2f}",
+                  fill=(150, 150, 150), font=font_meta)
+        draw.text((x_left, cap_y + 18),
+                  f"MODEL'S PICK (wrong)  label={mp.get('label', '-') or '-'}  GT={m['model_gt']:.1f}  pred={m['model_pred']:.2f}",
+                  fill=(255, 112, 112), font=font_title)
+        draw.text((x_right, cap_y),
+                  f"GT TOP PICK{ties}",
+                  fill=(150, 150, 150), font=font_meta)
+        draw.text((x_right, cap_y + 18),
+                  f"label={gp.get('label', '-') or '-'}  GT={m['gt_gt']:.1f}  pred={m['gt_pred']:.2f}",
+                  fill=(112, 255, 112), font=font_title)
+        y += row_h
+
+    # JPEG for size; PNG if caller chose .png
+    ext = os.path.splitext(args.out)[1].lower()
+    if ext in ('.jpg', '.jpeg'):
+        canvas.save(args.out, 'JPEG', quality=85, optimize=True)
+    else:
+        canvas.save(args.out)
+    print(f"Saved {args.out} ({img_w}x{img_h} px).")
+    print("In a Kaggle notebook:  from IPython.display import Image; Image(filename='" + args.out + "')")
 
 
 if __name__ == '__main__':
