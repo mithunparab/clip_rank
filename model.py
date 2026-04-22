@@ -237,7 +237,8 @@ class MobileCLIPRanker(nn.Module):
             raise ValueError(f"Unknown model '{name}'. Choose from: {list(VARIANTS.keys())}")
 
         v = VARIANTS[name]
-        print(f"Initializing {name} backbone...")
+        img_size = getattr(cfg.data, "img_size", 224)
+        print(f"Initializing {name} backbone at {img_size}x{img_size}...")
 
         if v["loader"] == "transformers_clip":
             from transformers import CLIPVisionModel
@@ -248,8 +249,11 @@ class MobileCLIPRanker(nn.Module):
             hf_model = AutoModel.from_pretrained(v["repo"])
             self.backbone = HFBackboneWrapper(hf_model)
         elif v["loader"] == "open_clip_hub":
-            # Standard OpenCLIP models — downloads pretrained weights automatically
-            model, _, _ = open_clip.create_model_and_transforms(v["arch"], pretrained=v["pretrained"])
+            # Standard OpenCLIP models — downloads pretrained weights automatically.
+            # force_image_size triggers position-embedding interpolation for non-224 input.
+            model, _, _ = open_clip.create_model_and_transforms(
+                v["arch"], pretrained=v["pretrained"], force_image_size=img_size
+            )
             self.backbone = model.visual
         elif v["loader"] == "pixio":
             from transformers import AutoModel
@@ -267,7 +271,12 @@ class MobileCLIPRanker(nn.Module):
             self.backbone = BirderBackboneWrapper(net)
         elif v["loader"] == "open_clip":
             ckpt_path = hf_hub_download(repo_id=v["repo"], filename=v["file"])
-            model, _, _ = open_clip.create_model_and_transforms(v["arch"], pretrained=ckpt_path)
+            # force_image_size: resize patch_embed + interpolate pos_embed to the target.
+            # MobileCLIP's timm ViT has strict_img_size asserts, so this is required for
+            # anything other than 224.
+            model, _, _ = open_clip.create_model_and_transforms(
+                v["arch"], pretrained=ckpt_path, force_image_size=img_size
+            )
             self.backbone = model.visual
         else:
             import mobileclip
@@ -276,7 +285,6 @@ class MobileCLIPRanker(nn.Module):
             self.backbone = model.image_encoder
 
         # Auto-detect backbone output dim instead of trusting registry
-        img_size = getattr(cfg.data, "img_size", 224)
         with torch.no_grad():
             dummy = torch.zeros(1, 3, img_size, img_size)
             self.backbone_dim = self.backbone(dummy).shape[-1]
