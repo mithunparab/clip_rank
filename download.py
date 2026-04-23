@@ -7,6 +7,7 @@ def download_dataset():
     files = {
         "annotations.csv": "annotations.csv",  # kept as source of labels, never overwritten
         "verifications.csv": "verifications.csv",
+        "best_image_training_data.csv": "best_image_training_data.csv",
     }
 
     for filename, destination in files.items():
