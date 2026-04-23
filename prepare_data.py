@@ -1,23 +1,21 @@
+import argparse
+import os
 import pandas as pd
 import requests
-import os
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 
 
-def download_one(row):
-    idx, url = row
-    filename = f"images/{idx}.jpg"
-
-    if os.path.exists(filename):
+def _download(args):
+    path, url = args
+    if os.path.exists(path):
         return
-
     try:
         resp = requests.get(url, timeout=5)
         if resp.status_code == 200:
-            with open(filename, 'wb') as f:
+            with open(path, 'wb') as f:
                 f.write(resp.content)
-    except:
+    except Exception:
         pass
 
 
@@ -27,7 +25,6 @@ def build_dataset(annotations_path, verifications_path):
     Join with original annotations to recover `label` where verifications lack it.
     Falls back to annotations alone if verifications.csv is missing.
     """
-    # Always read labels from annotations.csv — never the overwritten dataset.csv
     ann_label_path = 'annotations.csv'
     ann = pd.read_csv(ann_label_path if os.path.exists(ann_label_path) else annotations_path)
 
@@ -39,10 +36,8 @@ def build_dataset(annotations_path, verifications_path):
     print(f"verifications.csv: {len(ver)} rows, {ver['group_id'].nunique()} groups")
     print(f"verifications.csv columns: {list(ver.columns)}")
 
-    # verifications uses corrected_score ([-10, 10] scale) — rename to 'score'
     ver = ver.rename(columns={'corrected_score': 'score'})
 
-    # Pull labels from original annotations since verifications.corrected_label is all NaN
     url_to_label = ann.set_index('url')['label'].dropna()
     ver['label'] = ver['url'].map(url_to_label)
 
@@ -56,24 +51,64 @@ def build_dataset(annotations_path, verifications_path):
     return df
 
 
-def main():
+def run_scored():
     if not os.path.exists('images'):
         os.makedirs('images')
 
     df = build_dataset('annotations.csv', 'verifications.csv')
-
-    # Save merged result back so training uses corrected scores
     df.to_csv('dataset.csv', index=False)
     print("Saved merged dataset to dataset.csv")
 
-    tasks = list(zip(df.index, df['url']))
-
-    print(f"Downloading {len(tasks)} images...")
-
+    tasks = [(f"images/{idx}.jpg", url) for idx, url in zip(df.index, df['url'])]
+    print(f"Downloading {len(tasks)} images into images/ ...")
     with ThreadPoolExecutor(max_workers=16) as executor:
-        list(tqdm(executor.map(download_one, tasks), total=len(tasks)))
+        list(tqdm(executor.map(_download, tasks), total=len(tasks)))
+    print("Done. Images cached in images/.")
 
-    print("Done. Images cached in /images folder.")
+
+def run_binary(csv_path, images_dir):
+    """Download the binary one-hot preference set to a SEPARATE folder.
+
+    The binary CSV is keyed by `image_id`, whose integer values can collide
+    with scored-set row indexes used as filenames in images/. Keep them split.
+    """
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(
+            f"{csv_path} not found. Upload best_image_training_data.csv to the working dir "
+            "(on Kaggle: add it as a dataset and symlink/copy into the working dir)."
+        )
+    if not os.path.exists(images_dir):
+        os.makedirs(images_dir)
+
+    df = pd.read_csv(csv_path)
+    print(f"{csv_path}: {len(df)} rows, columns={list(df.columns)}")
+    n_groups = df['property_id'].nunique() if 'property_id' in df.columns else None
+    n_selected = int(df['selected'].sum()) if 'selected' in df.columns else None
+    print(f"  properties={n_groups}  selected={n_selected}")
+
+    tasks = [
+        (os.path.join(images_dir, f"{img_id}.jpg"), url)
+        for img_id, url in zip(df['image_id'], df['image_url'])
+    ]
+    print(f"Downloading {len(tasks)} binary images into {images_dir}/ ...")
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        list(tqdm(executor.map(_download, tasks), total=len(tasks)))
+    print(f"Done. Images cached in {images_dir}/.")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--mode', choices=['scored', 'binary'], default='scored',
+                        help="scored: download verifications-scored set into images/. "
+                             "binary: download best_image_training_data.csv into a separate dir.")
+    parser.add_argument('--binary-csv', default='best_image_training_data.csv')
+    parser.add_argument('--binary-images-dir', default='images_binary')
+    args = parser.parse_args()
+
+    if args.mode == 'scored':
+        run_scored()
+    else:
+        run_binary(args.binary_csv, args.binary_images_dir)
 
 
 if __name__ == "__main__":
