@@ -252,6 +252,29 @@ def validate_regression(model, df_val, cfg, device, use_cached=False, cache_dir=
     }
 
 
+def _load_binary_csv(binary_csv_path, images_dir):
+    """Load best_image_training_data.csv (property_id, image_id, image_url, selected)
+    and convert to the standard scored-dataset schema:
+        group_id (b_{property_id}), url, score (10 if selected else 0), label, file_path.
+
+    Only rows whose image file exists on disk are kept.
+    """
+    df = pd.read_csv(binary_csv_path)
+    df = df.rename(columns={'image_url': 'url'})
+    df['group_id'] = 'b_' + df['property_id'].astype(str)
+    df['score'] = df['selected'].astype(float) * 10.0
+    df['label'] = ''
+    df['file_path'] = df['image_id'].apply(
+        lambda x: os.path.join(images_dir, f"{x}.jpg")
+    )
+    before = len(df)
+    df = df[df['file_path'].apply(os.path.exists)].copy()
+    print(f"[binary] {len(df)}/{before} rows with images on disk | "
+          f"{df['group_id'].nunique()} groups | "
+          f"selected per group mean: {df.groupby('group_id')['selected'].sum().mean():.2f}")
+    return df[['group_id', 'url', 'score', 'label', 'file_path']]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--resume', type=str, default=None)
@@ -259,6 +282,13 @@ def main():
                         help='Use precomputed features (run precompute_features.py first)')
     parser.add_argument('--no-oversample', action='store_true',
                         help='Disable decile oversampling (for ablation)')
+    parser.add_argument('--binary-csv', type=str, default=None,
+                        help='Binary preference CSV (e.g. best_image_training_data.csv). '
+                             'Adds one-selected-per-group training signal.')
+    parser.add_argument('--binary-images-dir', type=str, default='images',
+                        help='Dir where binary images are saved by image_id (default: images)')
+    parser.add_argument('--scored-multiplier', type=int, default=10,
+                        help='Replicate scored groups N× when mixing with binary (default: 10)')
     args = parser.parse_args()
 
     rank, local_rank = setup_ddp()
@@ -291,16 +321,40 @@ def main():
             return huber_loss(preds, scores, vlen, delta=huber_delta)
         raise ValueError(f"Unknown loss '{loss_kind}' — expected 'softmax_ce' or 'huber'")
 
-    df = pd.read_csv(cfg.data.csv_path)
-    if 'file_path' not in df.columns:
-        df['file_path'] = df.index.map(lambda x: os.path.join('images', f"{x}.jpg"))
+    # Scored dataset (small, graded — used for val)
+    df_scored = pd.read_csv(cfg.data.csv_path)
+    if 'file_path' not in df_scored.columns:
+        df_scored['file_path'] = df_scored.index.map(lambda x: os.path.join('images', f"{x}.jpg"))
+    df_scored['group_id'] = 's_' + df_scored['group_id'].astype(str)
 
-    unique_groups = df['group_id'].unique()
+    # Val split comes from scored only — keeps Top1Acc comparable to previous runs
+    # and avoids contaminating val with binary groups that have a different label shape.
+    scored_groups = df_scored['group_id'].unique()
     rng = np.random.RandomState(seed)
-    rng.shuffle(unique_groups)
-    val_groups = unique_groups[:int(len(unique_groups) * 0.1)]
-    train_df = df[~df['group_id'].isin(val_groups)].copy()
-    val_df = df[df['group_id'].isin(val_groups)].copy()
+    rng.shuffle(scored_groups)
+    val_groups = scored_groups[:int(len(scored_groups) * 0.1)]
+    train_scored_df = df_scored[~df_scored['group_id'].isin(val_groups)].copy()
+    val_df = df_scored[df_scored['group_id'].isin(val_groups)].copy()
+
+    # Binary dataset (large, one-hot — training only)
+    binary_csv = args.binary_csv or getattr(cfg.data, 'binary_csv_path', None)
+    df_binary = None
+    if binary_csv and os.path.exists(binary_csv):
+        if rank == 0:
+            print(f"[data] Loading binary CSV: {binary_csv}")
+        df_binary = _load_binary_csv(binary_csv, args.binary_images_dir)
+
+    if df_binary is not None and not df_binary.empty:
+        # Ensure columns align before concat
+        keep = ['group_id', 'url', 'score', 'label', 'file_path']
+        for c in keep:
+            if c not in train_scored_df.columns:
+                train_scored_df[c] = ''
+        train_df = pd.concat(
+            [train_scored_df[keep], df_binary[keep]], ignore_index=True
+        )
+    else:
+        train_df = train_scored_df
 
     if use_cached:
         if not os.path.isdir(cache_dir):
@@ -313,8 +367,23 @@ def main():
         train_ds = PropertyPreferenceDataset(train_df, images_dir="images", is_train=True,
                                              img_size=cfg.data.img_size)
 
+    # Tag groups as scored vs binary so we can balance them.
+    n_scored_groups = sum(1 for g in train_ds.groups if str(g[0]['group_id']).startswith('s_'))
+    n_binary_groups = len(train_ds.groups) - n_scored_groups
     n_raw_groups = len(train_ds.groups)
-    if not args.no_oversample:
+
+    if df_binary is not None and not df_binary.empty:
+        # Don't decile-oversample in mixed mode: binary groups all have score 10/0 and
+        # would dominate the top bin, distorting scored-data weighting.
+        # Instead, replicate scored groups N× to compensate for the ~20:1 binary:scored ratio.
+        new_groups = []
+        for g in train_ds.groups:
+            if str(g[0]['group_id']).startswith('s_'):
+                new_groups.extend([g] * max(1, args.scored_multiplier))
+            else:
+                new_groups.append(g)
+        train_ds.groups = new_groups
+    elif not args.no_oversample:
         train_ds.groups = oversample_groups_by_decile(
             train_ds.groups, n_bins=oversample_bins, cap_ratio=oversample_cap
         )
@@ -382,10 +451,15 @@ def main():
 
     if rank == 0:
         loss_desc = 'softmax_CE(within-group)' if loss_kind == 'softmax_ce' else f'Huber(δ={huber_delta})'
-        print(f"Training on {n_eff_groups} groups (raw={n_raw_groups}, "
-              f"oversample={'off' if args.no_oversample else f'{oversample_bins}-bin cap={oversample_cap}x'}) | "
-              f"Loss={loss_desc} | accum={accum_steps} | AMP={use_amp}")
-        print(f"Primary metric: top1_acc (per-group: model's #1 pick == a GT-max image)")
+        if df_binary is not None and not df_binary.empty:
+            bal_desc = f'mixed: {n_scored_groups} scored ×{args.scored_multiplier} + {n_binary_groups} binary'
+        else:
+            bal_desc = ('off' if args.no_oversample else
+                        f'decile {oversample_bins}-bin cap={oversample_cap}x')
+        print(f"Training on {n_eff_groups} effective groups (raw={n_raw_groups}) | "
+              f"balance={bal_desc} | Loss={loss_desc} | accum={accum_steps} | AMP={use_amp}")
+        print(f"Val: {len(val_df['group_id'].unique())} scored groups | "
+              f"Primary metric: top1_acc (per-group: model's #1 pick == a GT-max image)")
 
     for epoch in range(start_epoch, cfg.train.epochs):
         model.train()
